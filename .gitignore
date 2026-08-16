@@ -1,0 +1,22 @@
+# Rust
+target/
+**/*.rs.bk
+
+# 前端 (Vue / Vite)
+node_modules/
+dist/
+.vite/
+*.local
+
+# 机器上的常量, 只提交 example
+yukipan.env
+.env
+
+# 本地数据根若被建在仓库里
+.YukiPan/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
