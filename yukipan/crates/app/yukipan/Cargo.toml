@@ -1,0 +1,11 @@
+[package]
+name = "yukipan"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "YukiPan 服务端二进制：装配与信号处理"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+yukipan-core = { workspace = true }

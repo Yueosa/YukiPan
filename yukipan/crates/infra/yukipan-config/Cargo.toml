@@ -1,0 +1,15 @@
+[package]
+name = "yukipan-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "YukiPan 配置解析：config.toml 读成朴素数据"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
