@@ -1,0 +1,28 @@
+# YukiPan 后端配置示例 (文档第 8 章)。
+#
+# 生产: install.sh 交互式收集机器常量后生成 ~/.YukiPan/config.toml, 不用手工复制。
+# 开发: cp config.example.toml config.dev.toml (已 gitignore), 改 database_url 密码。
+#
+# 环境变量: 后端只认 YUKIPAN_CONFIG —— 配置文件路径, 缺省 ~/.YukiPan/config.toml。
+# 单个字段没有 env 覆盖通道, 改配置就改文件。
+
+listen = "127.0.0.1:8516"
+data_root = "~/.YukiPan"
+database_url = "postgres://yukipan:CHANGE_ME@127.0.0.1:5432/yukipan"
+redis_url = "redis://127.0.0.1:6379"
+
+# 配额与单文件上限, 单位字节; 缺省即文档第 6 章预算, 下表仅为示意。
+# *_limit 是「引用配额」(同一内容挂多处按多处计); reserve 是真实磁盘余量红线。
+# 收新内容要同时过两道: 对应空间配额没超, 且盘上剩余 > reserve。
+[quota]
+# 私有网盘配额; 私有区无单文件上限, 大文件走这里
+private_limit = 15032385536   # 14 GiB
+# 图床配额
+images_limit = 2147483648     # 2 GiB
+# 访客网盘配额
+guest_limit = 2147483648      # 2 GiB
+# 余量红线; tmp/库/日志不进账本, 靠这道兜底
+reserve = 2147483648          # 2 GiB
+# 单文件大小限制: 按入口卡, 不按文件内容分类
+guest_max_file = 52428800     # 50 MiB; 只卡 /api/guest/upload
+images_max_file = 20971520    # 20 MiB; 只卡 /api/images/upload (另有扩展名白名单)

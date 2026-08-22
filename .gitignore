@@ -11,6 +11,7 @@ dist/
 # 机器上的常量, 只提交 example
 yukipan.env
 .env
+config.dev.toml
 
 # 本地数据根若被建在仓库里
 .YukiPan/
