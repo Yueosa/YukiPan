@@ -103,7 +103,7 @@ Postgres 管用户、会话、文件元数据、相册、标签这些要查询�
 
 ### 能做什么
 
-未登录: 丢一个文件上去, 当场拿到一条下载地址; 有地址就能下。关掉页面前看不到第二条路找回这个文件 — 没有公开目录可翻。
+未登录: 丢一个文件上去, 当场拿到一条下载地址; 有地址就能下。关掉页面前看不到第二条路找回这个文件 — 没有公开目录可翻。访客文件不是永久存的: 上传 24 小时后自动过期, 上传成功的响应里必须当场连下载地址一起把过期时间摆出来。过期 = 删指向, 磁盘引用计数归 0 才真正删那份内容。
 
 登录后: 看到访客空间里有什么、单条删、一键清空。私有区「分享到访客」在这里多一条指向: 多一个别人能下的地址, 磁盘还是那一份。从访客空间拿掉 = 删指向, 不删私有文件。
 
@@ -131,7 +131,7 @@ Postgres 管用户、会话、文件元数据、相册、标签这些要查询�
 
 公开页和上传口是冲着外网的, 要比私有区更防着点。至少包括这些:
 
-* **风暴**: 图床墙、访客上传/下载、登录接口, 用 Redis 做短时计数, 超了就挡。不要让公开页把进程或带宽拖死
+* **风暴**: 图床墙、访客上传/下载、登录接口, 用 Redis 做短时计数, 超了就挡。不要让公开页把进程或带宽拖死。访客上传单独按 IP 限: 每小时 10 次 / 200MB, 每天 500MB, 超限回 429。`/public/guest/` 的下载在 nginx 层限速: `limit_conn` 每 IP 4 连接 + `limit_rate 2m`。公开文件直出不经过后端, 做不到下载字节级的精确账本, 这是有意的权衡 — 防被当免费 CDN 刷带宽, 但不做精确计量
 * **密码爆破**: 登录失败按 IP 记, 同样走 Redis, 和风暴是一类计数、不同桶
 * **路径穿越**: 私有存储的路径必须关在自己的根里, `..`、绝对路径、往根外指的链接都不能过
 * **后端代码执行**: 用户丢上来的东西当数据, 不当脚本。别拼进 shell。html / svg 可以收, 当普通文本文件处理: 按 `text/plain` 送出, 并关掉内容类型嗅探, 浏览器就只是在看一段字, 不会当成页面或矢量图执行
@@ -145,12 +145,12 @@ Postgres 管用户、会话、文件元数据、相册、标签这些要查询�
 
 三个空间看到的不是三份文件, 是同一块磁盘上的内容被指了多次。**唯一真源是磁盘。** Postgres 里存的是指向、相册、标签、用量这些要查询的东西。接口按空间分流: 同一份内容出现在私有存储、图床还是访客, 决定走哪套列表、哪条取法。
 
-数据根在运行用户家目录下的 `~/.YukiPan` (启动时展开 `~`)。
+数据根在 `/var/lib/yukipan`。
 
 ### 磁盘
 
 ```text
-~/.YukiPan/
+/var/lib/yukipan/
   blobs/{aa}/{sha256}    # 按内容只放一份, 无扩展名; aa 是 hash 前两位
   private/{user_id}/     # 私有区看见的树, 文件是指向 blob 的 hardlink
   public/images/         # 图床墙上的文件名, 同样是 hardlink
@@ -197,8 +197,10 @@ Postgres 大约这些表 (名字可调, 关系不要扁):
 * blob (sha256, 大小)
 * 私有文件指向 (用户 + 逻辑路径 + hash)
 * 相册、图床指向 (相册、公开文件名、原名、hash、标签多对多)
-* 访客指向 (公开文件名、原名、hash、来源 IP)
+* 访客指向 (公开文件名、原名、hash、来源 IP、expires_at)
 * 标签 (按用户, 名字规范化后唯一)
+
+后端每小时跑一次 TTL 清扫任务: 删掉过期的访客指向 (expires_at 到点的), 引用计数归 0 的 blob 按上面的规则一并清掉。
 
 Redis 不存文件, 只记第 5 章那些短时计数。
 
@@ -260,7 +262,7 @@ JSON 一律 `{ success, data, message }`, 和 YukiLog 同一套。私有下载/�
 
 未登录只传。列表和删除要登录。下载有 `url` 就行。
 
-* `POST /api/guest/upload` 匿名, multipart, 回 `{ url, ... }`, 前端必须当场展示
+* `POST /api/guest/upload` 匿名, multipart, 回 `{ url, expires_at, ... }`, 前端必须当场连下载地址一起把过期时间展示出来
 * `GET /api/guest/list` 要登录, 分页
 * `POST /api/guest/delete` `{ id }`
 * `POST /api/guest/clear`
@@ -276,30 +278,51 @@ JSON 一律 `{ success, data, message }`, 和 YukiLog 同一套。私有下载/�
 
 ## 8. 部署
 
-安装和卸载就是仓库根上的 `install.sh` / `uninstall.sh`。脚本里只写动作, 域名、端口、服务名、库名这些常量不要在两个脚本里各抄一份, 单独放一个文件, 两边 `source`。
+部署体系用兄弟项目 YukiLog 的 `ops/` 那套。仓库根的 `install.sh` / `uninstall.sh` + `yukipan.env` 常量文件的旧方案作废, 不要再写。所有脚本都在 `ops/` 下, 配置集中到 `/etc/yukipan/`, 数据根是 `/var/lib/yukipan`, 前端落在 `/var/www/yukipan`。
 
-建议就叫 `yukipan.env` (仓库里留 `yukipan.env.example`, 机器上改过的那份不进 git)。systemd 也可以 `EnvironmentFile=` 指向同一份, 进程和脚本认的是同一套数。
+### 首次初始化: ops/bootstrap-host.sh
 
-### 常量文件里放什么
+新机器上跑一次, 交互式收集信息: 有 TTY 就逐条提问, 没有 TTY 就从 `YUKIPAN_*` 环境变量读。收集的内容包括域名 (默认 `pan.yeastar.xin`)、证书邮箱、是否在本机装 Postgres / Redis。
 
-机器和进程启动要用的, 例如:
+做完这些事:
 
-* 域名 `pan.yeastar.xin`
-* 后端绑 `127.0.0.1:8516`
-* 服务用户 (不要只信 `whoami`, sudo 时会变成 root)
-* 数据根: 该用户家目录下的 `~/.YukiPan`, 脚本用 `getent` 展开成绝对路径给 nginx
-* 前端落地 `/var/www/yukipan`
-* Postgres / Redis 连哪
-* 第一个用户怎么 bootstrap
+* 生成数据库密码等运行所需的密钥
+* 写 `/etc/yukipan/bootstrap.conf` (域名、邮箱这些机器常量) 和 `/etc/yukipan/config.toml` (基于仓库里的 `yukipan/config.example.toml` 实例化, 后端启动读这份)
+* 建系统用户和目录树: `/var/lib/yukipan` (数据根)、`/var/www/yukipan/releases/`、`/var/backups/yukipan`
+* 装 systemd unit 和 `/usr/local/sbin/` 下的管理命令
+* 用 `sed` 把 nginx 模板实例化成站点配置
 
-配额、会话时长这类以后会改的, 可以同文件, 也可以 install 时写进 `~/.YukiPan/config.toml` 给后端读。别在 nginx 配置和 unit 里再手写一遍绝对路径。
+### 发布: build-release + yukipan-deploy
 
-### 安装脚本做什么
+开发机上跑 `ops/build-release.sh` 打包出 release (后端二进制 + 前端产物 + sha256 MANIFEST)。服务器上跑 `yukipan-deploy` 部署:
 
-按服务用户建 `~/.YukiPan` 各目录 → 需要的话起/配 Postgres 和 Redis → 写出 nginx (模板里的数据根换成展开后的绝对路径) → 写出 systemd (`User=` 和数据根一致) → 前端放到 `/var/www/yukipan` → 起服务。
+* `flock` 防并发部署
+* 校验 sha256 / MANIFEST, 对不上就不动
+* 解到 `/var/www/yukipan/releases/<版本>/`, 原子切 `current` 软链
+* 切换后 30 秒轮询 `/api/health`, 起不来就自动回滚到上一个 release
 
-nginx 仍然是: 静态页、`/public/images/` 和 `/public/guest/` 直出、`/protected/` 仅内部、`/api/` 反代到 8516; 访客上传单独限制 body, 其它上传放宽; 反代关掉请求缓冲。TLS 交给 nginx。
+首次部署完成后创建第一个管理员用户: `sudo /var/www/yukipan/current/bin/yukipan-server user add <用户名>`, 交互式输两遍密码。私有区和所有管理接口都靠这个账号登录。
 
-### 卸载脚本做什么
+### 备份与恢复: yukipan-backup / yukipan-restore
 
-停并撤掉 unit、nginx 站点。`~/.YukiPan` 里是真文件, 卸服务默认别删盘; 要清数据单独留一个明确的开关, 免得手滑。
+`yukipan-backup`: `pg_dump` custom 格式 + `/etc/yukipan/` 配置副本, 落到 `/var/backups/yukipan/`。默认**不**背 `/var/lib/yukipan` 数据本体, 要带数据加 `--with-data` 开关。
+
+`yukipan-restore`: 恢复是危险动作, 必须带 `--confirm-restore`。先恢复进一个临时库, 校验通过再原子交换到正式库。
+
+### HTTPS: ops/enable-https.sh
+
+用 certbot webroot 方式申请证书, 把站点切到 HTTPS。申请前先确认域名解析已经指到这台机器。
+
+### 卸载: ops/uninstall.sh
+
+停并撤掉 unit、nginx 站点、`/usr/local/sbin/` 下的管理命令。默认**保留** `/var/lib/yukipan` (数据)、`/var/backups/yukipan` (备份)、`/etc/yukipan` (配置)。要全删加 `--purge`, 并且必须输入域名确认, 免得手滑。
+
+### 演练: ops/rehearsal/
+
+部署脚本的验证手段, 照搬 YukiLog 的封闭演练体系: 用 `systemd-nspawn` 起一次性 Ubuntu 24.04 容器, 断掉外部网络, 在容器里把 bootstrap → deploy → 升级 → 备份恢复完整跑一遍, 跑之前和跑之后对比宿主机不变量 (容器外的东西一点不许变)。脚本进了 ops/ 就要能过这一关, 不许只在真机上试错。
+
+### nginx 与 systemd
+
+nginx 仍然是: 静态页、`/public/images/` 和 `/public/guest/` 直出、`/protected/` 仅内部、`/api/` 反代到 8516; 访客上传单独限制 body, 其它上传放宽; 反代关掉请求缓冲; `/public/guest/` 那档限流速见第 5 章。直出的数据根是 `/var/lib/yukipan`。TLS 交给 nginx。
+
+systemd unit 带沙箱: `ProtectSystem=strict` + `ReadWritePaths=/var/lib/yukipan`, 后端进程只能写数据根, 别在 unit 和 nginx 配置里再手写一套不一致的路径。
