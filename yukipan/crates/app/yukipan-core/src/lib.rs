@@ -1,12 +1,12 @@
 //! YukiPan 装配层: 配置、库连接、域名服务、HTTP 监听、管理子命令。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use yukipan_api::AppState;
 use yukipan_config::{Config, ConfigError};
 use yukipan_db::DbError;
-use yukipan_store::{Store, StoreError};
+use yukipan_store::{BlobStore, Store, StoreError};
 
 /// 装配/运行期错误。
 #[derive(Debug, Error)]
@@ -34,16 +34,27 @@ pub enum CoreError {
 /// 装配并运行, 直到收到 SIGINT/SIGTERM 后优雅退出。
 pub async fn run() -> Result<(), CoreError> {
     let config = Config::load(config_path())?;
+    ensure_data_root_layout(&config.data_root)?;
     let pool = yukipan_db::connect(&config.database_url).await?;
     yukipan_db::migrate(&pool).await?;
     let app = yukipan_api::router(AppState {
-        store: Store::new(pool),
+        store: Store::new(pool.clone()),
+        blobs: BlobStore::new(pool, &config.data_root),
         config: config.clone(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    Ok(())
+}
+
+/// 数据根子目录布局兜底 (文档第 6 章)。生产由 ops/bootstrap-host.sh 建,
+/// 这里 create_dir_all 幂等补建, 让开发/手搓环境启动不踩缺目录的坑。
+fn ensure_data_root_layout(data_root: &Path) -> Result<(), CoreError> {
+    for sub in ["blobs", "private", "public/images", "public/guest", "tmp"] {
+        std::fs::create_dir_all(data_root.join(sub))?;
+    }
     Ok(())
 }
 

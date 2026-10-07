@@ -25,6 +25,17 @@ pub struct IngestOutcome {
     pub deduped: bool,
 }
 
+/// 私有区指向记录 (list_private_refs_under 的行)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateRef {
+    /// 逻辑路径。
+    pub path: String,
+    /// 指向的 blob hash。
+    pub sha256: String,
+    /// blob 字节数 (Join blobs 得来, 对账用)。
+    pub size: u64,
+}
+
 /// blob 存储入口: 连接池 + 数据根 (blobs/ 的父目录)。
 ///
 /// 与 [`crate::Store`] 并列: Store 管纯库的域 (用户/会话/配额账本),
@@ -49,12 +60,105 @@ impl BlobStore {
         &self.data_root
     }
 
-    /// 盘上 blob 路径: `blobs/{aa}/{sha256}`。
-    fn blob_path(&self, sha256: &str) -> PathBuf {
+    /// 盘上 blob 路径: `blobs/{aa}/{sha256}`。仅用于在私有区/公开区建 hardlink
+    /// 与内部清理, 不得回给前端。
+    pub fn blob_file_path(&self, sha256: &str) -> PathBuf {
         self.data_root
             .join("blobs")
             .join(&sha256[..2])
             .join(sha256)
+    }
+
+    /// 查 blob 大小; 库里没有该 hash 返回 None (秒传/下载前的存在性检查)。
+    pub async fn blob_size(&self, sha256: &str) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT size FROM blobs WHERE sha256 = $1")
+            .bind(sha256)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(n,)| n as u64))
+    }
+
+    /// 用户是否已持有至少一条指向该 hash 的私有区指向 (文档第 6 章秒传放行判据:
+    /// 只知道 hash、没有任何指向不能秒传, 防猜到私有文件 hash 挂进公开区)。
+    pub async fn user_has_private_ref(&self, user_id: Uuid, sha256: &str) -> Result<bool> {
+        let (yes,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM private_refs WHERE user_id = $1 AND sha256 = $2)",
+        )
+        .bind(user_id)
+        .bind(sha256)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(yes)
+    }
+
+    /// 移动/改名后同步指向路径 (文档第 6 章: 文件落盘写指向, 路径是指向的一部分)。
+    /// `from` 是文件时只改那一行; 是目录时其下所有指向按前缀平移。
+    /// 用 starts_with 而不是 LIKE: 路径里 `%`/`_` 是合法文件名字符, LIKE 会误配。
+    /// 返回受影响行数。
+    pub async fn rename_private_refs(
+        &self,
+        user_id: Uuid,
+        from: &LogicalPath,
+        to: &LogicalPath,
+    ) -> Result<u64> {
+        let n = sqlx::query(
+            "UPDATE private_refs SET path = $3 || substring(path from char_length($2) + 1)
+             WHERE user_id = $1 AND (path = $2 OR starts_with(path, $2 || '/'))",
+        )
+        .bind(user_id)
+        .bind(from.as_str())
+        .bind(to.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
+    /// 列某路径 (文件或目录前缀) 下的所有私有区指向, 带 blob 大小 (删除/对账用)。
+    /// 与 [`BlobStore::rename_private_refs`] 同一套前缀语义。
+    pub async fn list_private_refs_under(
+        &self,
+        user_id: Uuid,
+        prefix: &LogicalPath,
+    ) -> Result<Vec<PrivateRef>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT r.path, r.sha256, b.size
+             FROM private_refs r JOIN blobs b ON b.sha256 = r.sha256
+             WHERE r.user_id = $1 AND (r.path = $2 OR starts_with(r.path, $2 || '/'))
+             ORDER BY r.path",
+        )
+        .bind(user_id)
+        .bind(prefix.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, sha256, size)| PrivateRef {
+                path,
+                sha256,
+                size: size as u64,
+            })
+            .collect())
+    }
+
+    /// 删某路径 (文件或目录前缀) 下的所有私有区指向, 返回行数。
+    /// 调用方负责随后对每个受影响 hash 跑 [`BlobStore::delete_blob_if_unreferenced`]
+    /// 并减用量账。
+    pub async fn delete_private_refs_under(
+        &self,
+        user_id: Uuid,
+        prefix: &LogicalPath,
+    ) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM private_refs
+             WHERE user_id = $1 AND (path = $2 OR starts_with(path, $2 || '/'))",
+        )
+        .bind(user_id)
+        .bind(prefix.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
     }
 
     /// 把 tmp 文件收编成 blob: 流式算 SHA-256 (分块读, 不整读内存), 可选校验声明值,
@@ -227,7 +331,7 @@ impl BlobStore {
         if !done {
             return Ok(false);
         }
-        let path = self.blob_path(sha256);
+        let path = self.blob_file_path(sha256);
         if let Err(e) = spawn_blocking(move || std::fs::remove_file(path))
             .await
             .expect("删文件线程 panic")
@@ -406,7 +510,7 @@ mod tests {
         assert_eq!(out.size, content.len() as u64);
         assert!(!out.deduped);
         assert!(!t1.exists());
-        assert!(blobs.blob_path(&sha).exists());
+        assert!(blobs.blob_file_path(&sha).exists());
 
         // 同内容再收编: deduped=true, 盘上仍一份
         let t2 = write_tmp(&staging, "u2", content);
@@ -438,13 +542,13 @@ mod tests {
         assert_eq!(blobs.blob_ref_count(&sha).await.unwrap(), 1);
         // 仍被引用时不删
         assert!(!blobs.delete_blob_if_unreferenced(&sha).await.unwrap());
-        assert!(blobs.blob_path(&sha).exists());
+        assert!(blobs.blob_file_path(&sha).exists());
         // 撤指向 → 计数归 0 → 删行 + 删文件
         let removed = blobs.remove_private_ref(user.id, &path).await.unwrap();
         assert_eq!(removed, Some(sha.clone()));
         assert_eq!(blobs.blob_ref_count(&sha).await.unwrap(), 0);
         assert!(blobs.delete_blob_if_unreferenced(&sha).await.unwrap());
-        assert!(!blobs.blob_path(&sha).exists());
+        assert!(!blobs.blob_file_path(&sha).exists());
         // 再删返回 false (不存在)
         assert!(!blobs.delete_blob_if_unreferenced(&sha).await.unwrap());
     }

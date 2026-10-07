@@ -22,4 +22,6 @@ yukipan-store = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
+tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+yukipan-db = { workspace = true }

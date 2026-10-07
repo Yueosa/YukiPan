@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::{DataRoot, LogicalPath, ResolveError};
@@ -96,6 +96,23 @@ impl DataRoot {
             // 文件与符号链接都走 remove_file: 删链接本身, 不碰目标。
             fs::remove_file(&abs).map_err(map_io)
         }
+    }
+
+    /// 在私有区树内为 `target` (数据根内某 blob 的绝对路径) 建 hardlink。
+    ///
+    /// 安全不变量管的是「链接落在根内」: `path` 过 resolve_for_create,
+    /// 中间符号链接不得逃出根; `target` 本身必须是已存在的普通文件。
+    /// 目标位置已有条目 (含符号链接) 报 [`ResolveError::AlreadyExists`] — 不覆盖。
+    pub fn link_file(&self, path: &LogicalPath, target: &Path) -> Result<(), ResolveError> {
+        let abs = self.resolve_for_create(path)?;
+        if fs::symlink_metadata(&abs).is_ok() {
+            return Err(ResolveError::AlreadyExists);
+        }
+        let meta = fs::metadata(target).map_err(map_io)?;
+        if !meta.is_file() {
+            return Err(ResolveError::NotFound);
+        }
+        fs::hard_link(target, &abs).map_err(map_io)
     }
 
     /// 解析「叶子路径」: 父目录过 [`DataRoot::resolve_existing`] (必须在根内且是目录),
@@ -271,6 +288,26 @@ mod tests {
             let err = f.root.remove_entry(&LogicalPath::root(), recursive).unwrap_err();
             assert!(matches!(err, ResolveError::RootForbidden));
         }
+    }
+
+    #[test]
+    fn link_file_hardlinks_blob() {
+        let f = fixture();
+        let blob = f.outside.join("blob1");
+        fs::write(&blob, "content").unwrap();
+        fs::create_dir_all(f.root_path.join("docs")).unwrap();
+        f.root.link_file(&lp("docs/a.txt"), &blob).unwrap();
+        // 同一份内容两个名字, inode 级共享
+        assert_eq!(fs::read(f.root_path.join("docs/a.txt")).unwrap(), b"content");
+        assert_eq!(fs::metadata(&blob).unwrap().len(), 7);
+        // 已存在拒绝
+        let err = f.root.link_file(&lp("docs/a.txt"), &blob).unwrap_err();
+        assert!(matches!(err, ResolveError::AlreadyExists));
+        // 父目录不存在 / target 不是文件
+        let err = f.root.link_file(&lp("nope/b.txt"), &blob).unwrap_err();
+        assert!(matches!(err, ResolveError::NotFound));
+        let err = f.root.link_file(&lp("c.txt"), &f.outside).unwrap_err();
+        assert!(matches!(err, ResolveError::NotFound));
     }
 
     #[test]
