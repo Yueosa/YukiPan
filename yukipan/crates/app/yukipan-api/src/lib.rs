@@ -75,6 +75,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/guest/delete", post(guest::delete))
         .route("/api/guest/clear", post(guest::clear))
         .route("/api/guest/share", post(guest::share))
+        // 访客密钥门: verify 公开, keys 管理要登录
+        .route("/api/guest/verify", post(guest::verify))
+        .route("/api/guest/keys", get(guest::list_keys).post(guest::create_key))
+        .route("/api/guest/keys/revoke", post(guest::revoke_key))
         .with_state(state)
 }
 
@@ -174,6 +178,13 @@ mod tests {
             ),
             ("POST", "/api/guest/clear", Body::empty()),
             ("POST", "/api/guest/share", Body::from(r#"{"path":"a.txt"}"#)),
+            ("GET", "/api/guest/keys", Body::empty()),
+            ("POST", "/api/guest/keys", Body::from(r#"{"ttl":"1h"}"#)),
+            (
+                "POST",
+                "/api/guest/keys/revoke",
+                Body::from(r#"{"id":"00000000-0000-0000-0000-000000000000"}"#),
+            ),
         ];
         for (method, uri, body) in cases {
             let resp = router(test_state())

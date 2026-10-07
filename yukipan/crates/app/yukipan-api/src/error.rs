@@ -42,6 +42,10 @@ impl ApiError {
         Self::BadRequest(message.into())
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden(message.into())
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::NotFound(message.into())
     }
@@ -82,6 +86,8 @@ impl From<StoreError> for ApiError {
             StoreError::AlbumNotEmpty => Self::conflict("相册非空, 请先移走其中的图"),
             StoreError::DefaultAlbumForbidden => Self::bad_request("默认相册不能删除"),
             StoreError::ImageNotFound => Self::not_found("图片不存在"),
+            StoreError::GuestKeyNotFound => Self::not_found("密钥不存在"),
+            StoreError::GuestKeyRevoked => Self::conflict("密钥已吊销"),
             other => {
                 error!("store error: {other}");
                 Self::Internal("内部错误".into())

@@ -6,12 +6,14 @@
 
 mod blob;
 mod guest;
+mod guest_key;
 mod image;
 mod quota;
 mod thumbs;
 
 pub use blob::{BlobStore, IngestOutcome, PrivateRef};
 pub use guest::{GuestRef, finish_guest_ref_delete, sweep_expired_guests};
+pub use guest_key::{CODE_LEN, GuestKey, normalize_code};
 pub use image::{Album, AlbumSummary, ImageRef, TagSummary, normalize_tag_name};
 pub use quota::{Space, disk_free};
 pub use thumbs::THUMB_MAX_EDGE;
@@ -96,6 +98,12 @@ pub enum StoreError {
     /// 图片指向不存在 (或不属于当前用户)。
     #[error("图片不存在")]
     ImageNotFound,
+    /// 密钥不存在。
+    #[error("密钥不存在")]
+    GuestKeyNotFound,
+    /// 密钥已吊销。
+    #[error("密钥已吊销")]
+    GuestKeyRevoked,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;

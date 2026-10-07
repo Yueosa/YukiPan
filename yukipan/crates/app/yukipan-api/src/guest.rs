@@ -38,6 +38,8 @@ pub struct GuestView {
     pub sha256: String,
     pub size: u64,
     pub source_ip: String,
+    /// 带上来的密钥短码 (管理员分享为 null)。
+    pub key_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -65,6 +67,36 @@ pub struct IdReq {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateKeyReq {
+    /// 只收 "30m" | "1h" | "24h"。
+    ttl: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyReq {
+    code: String,
+}
+
+/// 密钥视图 (管理列表/签发响应)。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct GuestKeyView {
+    pub id: Uuid,
+    pub code: String,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub file_count: u64,
+}
+
+/// verify 出参。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct VerifyResp {
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ShareReq {
     path: String,
 }
@@ -83,12 +115,118 @@ fn guest_view(r: GuestRef) -> GuestView {
         sha256: r.sha256,
         size: r.size,
         source_ip: r.source_ip.to_string(),
+        key_code: r.key_code,
         created_at: r.created_at,
         expires_at: r.expires_at,
     }
 }
 
-/// `POST /api/guest/upload` — 匿名。三道按 IP 限流全过才收。
+/// ttl 档位解析: 只收 30m/1h/24h。
+fn parse_key_ttl(ttl: &str) -> Result<chrono::Duration, ApiError> {
+    match ttl {
+        "30m" => Ok(chrono::Duration::minutes(30)),
+        "1h" => Ok(chrono::Duration::hours(1)),
+        "24h" => Ok(chrono::Duration::hours(24)),
+        _ => Err(ApiError::bad_request("ttl 只支持 30m / 1h / 24h")),
+    }
+}
+
+/// `POST /api/guest/keys` — 签发密钥 (管理员)。
+pub async fn create_key(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<CreateKeyReq>,
+) -> Result<Json<Envelope<GuestKeyView>>, ApiError> {
+    let ttl = parse_key_ttl(&req.ttl)?;
+    let note = req.note.unwrap_or_default();
+    let key = state.blobs.create_guest_key(ttl, &note).await?;
+    Ok(Json(Envelope::ok(GuestKeyView {
+        id: key.id,
+        code: key.code,
+        note: key.note,
+        created_at: key.created_at,
+        expires_at: key.expires_at,
+        revoked_at: key.revoked_at,
+        file_count: 0,
+    })))
+}
+
+/// `GET /api/guest/keys` — 密钥列表 (管理员), 创建时间倒序带现存指向数。
+pub async fn list_keys(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Envelope<ListWrap<GuestKeyView>>>, ApiError> {
+    let items = state
+        .blobs
+        .list_guest_keys()
+        .await?
+        .into_iter()
+        .map(|(key, file_count)| GuestKeyView {
+            id: key.id,
+            code: key.code,
+            note: key.note,
+            created_at: key.created_at,
+            expires_at: key.expires_at,
+            revoked_at: key.revoked_at,
+            file_count,
+        })
+        .collect();
+    Ok(Json(Envelope::ok(ListWrap { items })))
+}
+
+/// 列表包装 (keys 没有分页, 数量小)。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ListWrap<T> {
+    pub items: Vec<T>,
+}
+
+/// `POST /api/guest/keys/revoke` `{ id }` — 吊销: 置 revoked_at + 级联删全部指向。
+pub async fn revoke_key(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<IdReq>,
+) -> Result<Json<Envelope<ClearResp>>, ApiError> {
+    let refs = state.blobs.revoke_guest_key(req.id).await?;
+    let mut cleared = 0;
+    for r in refs {
+        yukipan_store::finish_guest_ref_delete(&state.blobs, &state.store, &r).await;
+        cleared += 1;
+    }
+    Ok(Json(Envelope::ok(ClearResp { cleared })))
+}
+
+/// `POST /api/guest/verify` — 公开: 校验密钥, 有效回 expires_at。
+/// 按 IP 爆破计数 (与登录同一套阈值语义, 文档第 5 章)。
+pub async fn verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    connect_info: MaybeConnectInfo,
+    Json(req): Json<VerifyReq>,
+) -> Result<Json<Envelope<VerifyResp>>, ApiError> {
+    let ip = client_ip(&headers, connect_info.0);
+    let fail_key = format!("guest:verify:fail:{ip}");
+    if state.limiter.get(&fail_key).await >= state.config.auth.login_fail_max {
+        return Err(too_many(&state.limiter, &fail_key, "尝试次数过多").await);
+    }
+    let key = state.blobs.verify_guest_key(&req.code).await?;
+    let Some(key) = key else {
+        state
+            .limiter
+            .incr(
+                &fail_key,
+                Duration::from_secs(state.config.auth.login_fail_window_secs),
+            )
+            .await;
+        return Err(ApiError::forbidden("密钥无效或已过期"));
+    };
+    state.limiter.clear(&fail_key).await;
+    Ok(Json(Envelope::ok(VerifyResp {
+        expires_at: key.expires_at,
+    })))
+}
+
+/// `POST /api/guest/upload` — 密钥门 (文档第 4 章): 必须带有效 `X-Guest-Key` 头
+/// (先于限流与白名单, 不消耗限流桶); 文件寿命 = 密钥寿命。三道按 IP 限流是第二层。
 pub async fn upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -98,6 +236,17 @@ pub async fn upload(
     let ip = client_ip(&headers, connect_info.0);
     let guest_cfg = &state.config.guest;
     let max_file = state.config.quota.guest_max_file;
+
+    // 密钥门: 缺头/无效/过期/吊销统一 403, 不区分防探测。
+    let code = headers
+        .get("x-guest-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let key = state
+        .blobs
+        .verify_guest_key(code)
+        .await?
+        .ok_or_else(|| ApiError::forbidden("密钥无效或已过期"))?;
 
     // 第一道: 次数/小时。每次尝试都计数 (被拒的也算, 防试探)。
     let cnt_key = format!("guest:cnt:{ip}");
@@ -156,7 +305,7 @@ pub async fn upload(
     // 匿名上传记 owner 的 guest 账 (单用户应用即管理员; 见 store::guest 模块文档)。
     let charged = state.blobs.owner_user_id().await?;
     let resp = finish_guest_upload(
-        &state, &tmp, &filename, &ext, ip, charged, size,
+        &state, &tmp, &filename, &ext, ip, charged, size, &key,
     )
     .await;
     if resp.is_err() {
@@ -236,7 +385,9 @@ pub async fn share(
     let Some((sha256, size)) = state.blobs.get_private_ref(uid, &path).await? else {
         return Err(ApiError::not_found("私有路径不存在或不是文件"));
     };
-    let r = hang_guest_ref(&state, name, &ext, &sha256, size, ip, uid).await?;
+    // 管理员分享豁免密钥 (文档第 4 章): key_id = NULL, 保留固定 24h TTL。
+    let expires_at = Utc::now() + chrono::Duration::hours(state.config.guest.ttl_hours as i64);
+    let r = hang_guest_ref(&state, name, &ext, &sha256, size, ip, uid, None, expires_at).await?;
     Ok(Json(Envelope::ok(GuestUploadResp {
         url: format!("{PUBLIC_URL_PREFIX}{}", r.public_name),
         orig_name: r.orig_name,
@@ -256,6 +407,7 @@ async fn finish_guest_upload(
     ip: std::net::IpAddr,
     charged: Option<Uuid>,
     size: u64,
+    key: &yukipan_store::GuestKey,
 ) -> Result<GuestUploadResp, ApiError> {
     let limit = state.config.quota.guest_limit;
     let Some(uid) = charged else {
@@ -272,7 +424,7 @@ async fn finish_guest_upload(
         rollback_blob(state, &outcome.sha256).await;
         return Err(e.into());
     }
-    match insert_guest_link(state, orig_name, ext, &outcome.sha256, outcome.size, ip, uid).await {
+    match insert_guest_link(state, orig_name, ext, &outcome.sha256, outcome.size, ip, uid, Some(key.id), key.expires_at).await {
         Ok(r) => Ok(GuestUploadResp {
             url: format!("{PUBLIC_URL_PREFIX}{}", r.public_name),
             orig_name: r.orig_name,
@@ -298,13 +450,15 @@ async fn hang_guest_ref(
     size: u64,
     ip: std::net::IpAddr,
     charged: Uuid,
+    key_id: Option<Uuid>,
+    expires_at: DateTime<Utc>,
 ) -> Result<GuestRef, ApiError> {
     let limit = state.config.quota.guest_limit;
     state
         .store
         .usage_add(charged, Space::Guest, size, limit)
         .await?;
-    match insert_guest_link(state, orig_name, ext, sha256, size, ip, charged).await {
+    match insert_guest_link(state, orig_name, ext, sha256, size, ip, charged, key_id, expires_at).await {
         Ok(r) => Ok(r),
         Err(e) => {
             rollback_usage(state, charged, size).await;
@@ -322,6 +476,8 @@ async fn insert_guest_link(
     size: u64,
     ip: std::net::IpAddr,
     charged: Uuid,
+    key_id: Option<Uuid>,
+    expires_at: DateTime<Utc>,
 ) -> Result<GuestRef, ApiError> {
     let public_name = format!("{}.{}", Uuid::new_v4(), ext);
     let target = state
@@ -331,10 +487,9 @@ async fn insert_guest_link(
         .join(&public_name);
     std::fs::create_dir_all(target.parent().expect("public/guest 必有父")).map_err(internal_io)?;
     std::fs::hard_link(state.blobs.blob_file_path(sha256), &target).map_err(internal_io)?;
-    let expires_at = Utc::now() + chrono::Duration::hours(state.config.guest.ttl_hours as i64);
     match state
         .blobs
-        .insert_guest_ref(&public_name, orig_name, sha256, size, ip, charged, expires_at)
+        .insert_guest_ref(&public_name, orig_name, sha256, size, ip, charged, key_id, expires_at)
         .await
     {
         Ok(r) => Ok(r),
@@ -376,6 +531,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_ttl_parsing() {
+        assert_eq!(parse_key_ttl("30m").unwrap(), chrono::Duration::minutes(30));
+        assert_eq!(parse_key_ttl("1h").unwrap(), chrono::Duration::hours(1));
+        assert_eq!(parse_key_ttl("24h").unwrap(), chrono::Duration::hours(24));
+        for bad in ["7d", "60m", "", "24H"] {
+            assert!(parse_key_ttl(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn guest_ext_whitelist() {
         for ok in ["a.jpg", "a.PNG", "a.pdf", "a.zip", "a.7z", "a.txt", "a.md", "x.y.zip"] {
             assert!(guest_ext(ok).is_some(), "{ok}");
@@ -390,7 +555,7 @@ mod tests {
 /// 触真库 + 真 Redis:
 /// `YUKIPAN_TEST_DB_URL=postgres://... YUKIPAN_TEST_REDIS_URL=redis://... cargo test -p yukipan-api -- --ignored`
 #[cfg(test)]
-mod db_tests {
+pub(super) mod db_tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -405,14 +570,14 @@ mod db_tests {
 
     use super::*;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _tmp: TempDir,
-        app: Router,
-        state: AppState,
-        pool: PgPool,
+        pub(super) app: Router,
+        pub(super) state: AppState,
+        pub(super) pool: PgPool,
     }
 
-    async fn fixture(extra_config: &str) -> Fixture {
+    pub(super) async fn fixture(extra_config: &str) -> Fixture {
         let url = std::env::var("YUKIPAN_TEST_DB_URL").expect("缺少 YUKIPAN_TEST_DB_URL");
         let redis_url =
             std::env::var("YUKIPAN_TEST_REDIS_URL").expect("缺少 YUKIPAN_TEST_REDIS_URL");
@@ -442,13 +607,13 @@ mod db_tests {
         }
     }
 
-    async fn make_user(state: &AppState, tag: Uuid, name: &str) -> (Uuid, String) {
+    pub(super) async fn make_user(state: &AppState, tag: Uuid, name: &str) -> (Uuid, String) {
         let username = format!("{name}-{tag}");
         let u = state.store.create_user(&username, "pw").await.unwrap();
         (u.id, username)
     }
 
-    async fn login(app: &Router, username: &str, ip: &str) -> String {
+    pub(super) async fn login(app: &Router, username: &str, ip: &str) -> String {
         let resp = app
             .clone()
             .oneshot(
@@ -474,7 +639,7 @@ mod db_tests {
             .to_string()
     }
 
-    async fn call(
+    pub(super) async fn call(
         app: &Router,
         method: &str,
         uri: &str,
@@ -496,14 +661,14 @@ mod db_tests {
         app.clone().oneshot(req.body(body).unwrap()).await.unwrap()
     }
 
-    async fn json_body(resp: Response) -> Value {
+    pub(super) async fn json_body(resp: Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn post_json(
+    pub(super) async fn post_json(
         app: &Router,
         uri: &str,
         cookie: Option<&str>,
@@ -523,7 +688,7 @@ mod db_tests {
         (status, json_body(resp).await)
     }
 
-    fn multipart(filename: &str, content: &[u8]) -> (String, Vec<u8>) {
+    pub(super) fn multipart(filename: &str, content: &[u8]) -> (String, Vec<u8>) {
         let boundary = "TESTBOUNDARY";
         let mut body = Vec::new();
         body.extend_from_slice(
@@ -537,14 +702,35 @@ mod db_tests {
         (format!("multipart/form-data; boundary={boundary}"), body)
     }
 
-    async fn guest_upload(
+    /// 直接走 store 签发一个 24h 测试密钥, 返回 (id, code)。
+    pub(super) async fn test_key(state: &AppState) -> (Uuid, String) {
+        let key = state
+            .blobs
+            .create_guest_key(chrono::Duration::hours(24), "test")
+            .await
+            .unwrap();
+        (key.id, key.code)
+    }
+
+    pub(super) async fn guest_upload(
         app: &Router,
         ip: &str,
+        key: Option<&str>,
         filename: &str,
         content: &[u8],
     ) -> (StatusCode, Value) {
         let (ct, body) = multipart(filename, content);
-        let resp = call(app, "POST", "/api/guest/upload", None, Some(ip), Some(&ct), Body::from(body)).await;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/guest/upload")
+            .header("content-type", &ct);
+        if let Some(ip) = Some(ip) {
+            req = req.header("x-real-ip", ip);
+        }
+        if let Some(k) = key {
+            req = req.header("x-guest-key", k);
+        }
+        let resp = app.clone().oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
         let status = resp.status();
         (status, json_body(resp).await)
     }
@@ -558,11 +744,12 @@ mod db_tests {
         let c1 = login(&f.app, &name1, "10.0.0.1").await;
         // 限流桶在 Redis 里活一小时, 测试 IP 按 run 唯一, 重复跑互不干扰
         let guest_ip = format!("1.2.3.{}", tag.as_u128() % 200 + 1);
+        let (_kid, kcode) = test_key(&f.state).await;
 
-        // 匿名上传: url/过期时间当场给出 (文档第 4 章)
+        // 匿名上传 (带密钥): url/过期时间当场给出 (文档第 4 章)
         let content = format!("guest doc {tag}").into_bytes();
         let l1 = content.len() as u64;
-        let (st, v) = guest_upload(&f.app, &guest_ip, "a.pdf", &content).await;
+        let (st, v) = guest_upload(&f.app, &guest_ip, Some(&kcode), "a.pdf", &content).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["data"]["deduped"], false);
         let url = v["data"]["url"].as_str().unwrap().to_string();
@@ -576,10 +763,15 @@ mod db_tests {
         assert!(f.state.blobs.data_root().join("public/guest").join(&public1).exists());
 
         // 白名单: exe 不收 (html/svg/js 也不在白名单)
-        let (st, _) = guest_upload(&f.app, &guest_ip, "evil.exe", b"x").await;
+        let (st, _) = guest_upload(&f.app, &guest_ip, Some(&kcode), "evil.exe", b"x").await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
-        let (st, _) = guest_upload(&f.app, &guest_ip, "evil.html", b"<html>").await;
+        let (st, _) = guest_upload(&f.app, &guest_ip, Some(&kcode), "evil.html", b"<html>").await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+        // 无密钥/坏密钥 → 403 (先于限流与白名单)
+        let (st, _) = guest_upload(&f.app, &guest_ip, None, "a.pdf", &content).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = guest_upload(&f.app, &guest_ip, Some("XXXXXXXX"), "a.pdf", &content).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
 
         // 列表要登录; 登录后可见, 带来源 IP 与过期时间
         let resp = call(&f.app, "GET", "/api/guest/list", None, None, None, Body::empty()).await;
@@ -633,7 +825,7 @@ mod db_tests {
 
         // TTL 清扫: 再传一条, 手工把它改成已过期, 触发清扫 → 指向/blob 收尾
         let content2 = format!("guest expire {tag}").into_bytes();
-        let (st, v) = guest_upload(&f.app, &guest_ip, "old.zip", &content2).await;
+        let (st, v) = guest_upload(&f.app, &guest_ip, Some(&kcode), "old.zip", &content2).await;
         assert_eq!(st, StatusCode::OK);
         let url2 = v["data"]["url"].as_str().unwrap().to_string();
         let public2 = url2.trim_start_matches("/public/guest/").to_string();
@@ -658,15 +850,24 @@ mod db_tests {
         let f = fixture("[guest]\nupload_per_hour = 2").await;
         let (_u, name) = make_user(&f.state, tag, "rc").await;
         let _ = login(&f.app, &name, "10.0.0.2").await;
+        let (_kid, kc) = test_key(&f.state).await;
+        let kc = kc.as_str();
         let ip = format!("11.0.0.{}", tag.as_u128() % 200 + 1);
         let c = format!("rate count {tag}").into_bytes();
-        let (st, _) = guest_upload(&f.app, &ip, "a.txt", &c).await;
+        let (st, _) = guest_upload(&f.app, &ip, Some(kc), "a.txt", &c).await;
         assert_eq!(st, StatusCode::OK);
-        let (st, _) = guest_upload(&f.app, &ip, "b.txt", &c).await;
+        let (st, _) = guest_upload(&f.app, &ip, Some(kc), "b.txt", &c).await;
         assert_eq!(st, StatusCode::OK);
         // 第三次触发 429: 带 Retry-After 头与剩余时间消息
         let (ct, body) = multipart("c.txt", &c);
-        let resp = call(&f.app, "POST", "/api/guest/upload", None, Some(&ip), Some(&ct), Body::from(body)).await;
+        let resp = f.app.clone().oneshot(
+            Request::post("/api/guest/upload")
+                .header("content-type", &ct)
+                .header("x-real-ip", &ip)
+                .header("x-guest-key", kc)
+                .body(Body::from(body))
+                .unwrap(),
+        ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry = resp.headers().get("retry-after").unwrap().to_str().unwrap();
         let retry_secs: u64 = retry.parse().unwrap();
@@ -676,19 +877,28 @@ mod db_tests {
         assert!(msg.contains("上传太频繁") && (msg.contains("分钟") || msg.contains("秒")), "{msg}");
         // 别的 IP 不受影响
         let other_ip = format!("11.0.1.{}", tag.as_u128() % 200 + 1);
-        let (st, _) = guest_upload(&f.app, &other_ip, "d.txt", &c).await;
+        let (st, _) = guest_upload(&f.app, &other_ip, Some(kc), "d.txt", &c).await;
         assert_eq!(st, StatusCode::OK);
 
         // 字节桶: 每小时 3000 字节, 两次 2000 第二次爆
         let f2 = fixture("[guest]\nupload_per_hour = 1000\nupload_bytes_per_hour = 3000\nupload_bytes_per_day = 5000").await;
         let (_u2, name2) = make_user(&f2.state, tag, "rb").await;
         let _ = login(&f2.app, &name2, "10.0.0.3").await;
+        let (_kid2, kc2) = test_key(&f2.state).await;
+        let kc2 = kc2.as_str();
         let ip2 = format!("12.0.0.{}", tag.as_u128() % 200 + 1);
         let big = tag.to_string().repeat(60).into_bytes();
-        let (st, _) = guest_upload(&f2.app, &ip2, "x.zip", &big[..2000]).await;
+        let (st, _) = guest_upload(&f2.app, &ip2, Some(kc2), "x.zip", &big[..2000]).await;
         assert_eq!(st, StatusCode::OK);
         let (ct, body) = multipart("y.zip", &big[..2000]);
-        let resp = call(&f2.app, "POST", "/api/guest/upload", None, Some(&ip2), Some(&ct), Body::from(body)).await;
+        let resp = f2.app.clone().oneshot(
+            Request::post("/api/guest/upload")
+                .header("content-type", &ct)
+                .header("x-real-ip", &ip2)
+                .header("x-guest-key", kc2)
+                .body(Body::from(body))
+                .unwrap(),
+        ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get("retry-after").is_some());
         let v = json_body(resp).await;
@@ -751,5 +961,145 @@ mod db_tests {
         assert!(msg.contains("失败次数过多") && msg.contains("分钟后重试"), "{msg}");
         // 清理, 别影响其他用例 (不同 IP 桶, 但保持整洁)
         f.state.limiter.clear(&format!("login:fail:{ip}")).await;
+    }
+}
+
+/// 密钥门全流程 (触真库 + 真 Redis)。
+#[cfg(test)]
+mod key_tests {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+    use yukipan_store::Space;
+
+    use super::db_tests::*;
+
+    #[tokio::test]
+    #[ignore = "需要真实 PostgreSQL 与 Redis, 设 YUKIPAN_TEST_DB_URL/YUKIPAN_TEST_REDIS_URL 后加 --ignored 跑"]
+    async fn guest_keys_full_flow() {
+        let f = fixture("").await;
+        let tag = Uuid::new_v4();
+        let (_u1, name1) = make_user(&f.state, tag, "gk").await;
+        let c1 = login(&f.app, &name1, "10.9.0.1").await;
+        let ip = format!("14.0.0.{}", tag.as_u128() % 200 + 1);
+
+        // 三档签发 + 非法档 400
+        let mut codes = vec![];
+        for ttl in ["30m", "1h", "24h"] {
+            let (st, v) = post_json(&f.app, "/api/guest/keys", Some(&c1), json!({"ttl": ttl, "note": "测试"})).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let code = v["data"]["code"].as_str().unwrap().to_string();
+            assert_eq!(code.len(), 8);
+            assert!(code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+            codes.push((v["data"]["id"].as_str().unwrap().to_string(), code, v["data"]["expires_at"].as_str().unwrap().to_string()));
+        }
+        let (st, _) = post_json(&f.app, "/api/guest/keys", Some(&c1), json!({"ttl": "7d"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (key24_id, key24, key24_exp) = codes[2].clone();
+
+        // verify: 正确码 (原样/小写+横杠+空格) 200; 错码 403
+        for variant in [
+            key24.clone(),
+            key24.to_lowercase(),
+            format!("{}-{}", &key24[..4], &key24[4..]),
+            format!("{} {}", &key24[..4], &key24[4..]),
+        ] {
+            let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&ip), Some("application/json"),
+                Body::from(json!({"code": variant}).to_string())).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{variant}");
+        }
+        let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&ip), Some("application/json"),
+            Body::from(json!({"code": "XXXXXXXX"}).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 带密钥上传: expires_at == 密钥过期时间; 大小写分组的头也认
+        let content = format!("key gated {tag}").into_bytes();
+        let l1 = content.len() as u64;
+        let grouped = format!("{}-{}", &key24[..4].to_lowercase(), &key24[4..].to_lowercase());
+        let (st, v) = guest_upload(&f.app, &ip, Some(&grouped), "gated.txt", &content).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["data"]["expires_at"].as_str().unwrap(), key24_exp);
+        let sha = v["data"]["sha256"].as_str().unwrap().to_string();
+
+        // list 带 key_code
+        let resp = call(&f.app, "GET", "/api/guest/list", Some(&c1), None, None, Body::empty()).await;
+        let v = json_body(resp).await;
+        let item = v["data"]["items"].as_array().unwrap().iter()
+            .find(|i| i["sha256"] == sha).unwrap().clone();
+        assert_eq!(item["key_code"].as_str().unwrap(), key24);
+
+        // keys 列表: file_count 含这条
+        let resp = call(&f.app, "GET", "/api/guest/keys", Some(&c1), None, None, Body::empty()).await;
+        let v = json_body(resp).await;
+        let k = v["data"]["items"].as_array().unwrap().iter()
+            .find(|k| k["code"] == key24).unwrap().clone();
+        assert_eq!(k["file_count"], 1);
+
+        // 过期密钥: verify/upload 都 403 (手工改过期)
+        sqlx::query("UPDATE guest_keys SET expires_at = now() - interval '1 hour' WHERE code = $1")
+            .bind(&codes[0].1)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&ip), Some("application/json"),
+            Body::from(json!({"code": codes[0].1}).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let (st, _) = guest_upload(&f.app, &ip, Some(&codes[0].1), "exp.txt", &content).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // 吊销前: owner 账本至少含我们这条 (匿名上传记 owner; 该账本是全局共享的,
+        // 并行用例也在写, 不能断言精确差值)
+        let g = f.state.blobs.get_guest_ref(item["id"].as_str().unwrap().parse().unwrap()).await.unwrap().unwrap();
+        let used_before = f.state.store.usage_get(g.charged_to, Space::Guest).await.unwrap();
+        assert!(used_before >= l1, "owner 账本 {used_before} 应至少含本文件 {l1}");
+
+        // 吊销: 级联删文件, 指向/公开文件/blob 全消失, 账本回落
+        let resp = call(&f.app, "POST", "/api/guest/keys/revoke", Some(&c1), None, Some("application/json"),
+            Body::from(json!({"id": key24_id}).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["data"]["cleared"], 1);
+        assert!(f.state.blobs.blob_file_path(&sha).exists() == false);
+        // 账本对账的机制 (finish_guest_ref_delete → usage_sub) 由切片 1/4 的
+        // 单用户用例覆盖; 这里 owner 共享账本在并行下无法断言精确差值。
+        // 吊销后 verify/upload 403
+        let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&ip), Some("application/json"),
+            Body::from(json!({"code": key24}).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let (st, _) = guest_upload(&f.app, &ip, Some(&key24), "gone.txt", &content).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // 再吊销 409, 不存在 404
+        let (st, _) = post_json(&f.app, "/api/guest/keys/revoke", Some(&c1), json!({"id": key24_id})).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        let (st, _) = post_json(&f.app, "/api/guest/keys/revoke", Some(&c1), json!({"id": Uuid::new_v4()})).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // verify 爆破: 换干净 IP 连错 10 次 → 429
+        let bf_ip = format!("15.0.0.{}", tag.as_u128() % 200 + 1);
+        for _ in 0..10 {
+            let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&bf_ip), Some("application/json"),
+                Body::from(json!({"code": "XXXXXXXX"}).to_string())).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        let resp = call(&f.app, "POST", "/api/guest/verify", None, Some(&bf_ip), Some("application/json"),
+            Body::from(json!({"code": codes[1].1}).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        f.state.limiter.clear(&format!("guest:verify:fail:{bf_ip}")).await;
+
+        // share 免密钥, 仍是固定 24h, key_code = null
+        let (ct, body) = multipart("shared.txt", &content);
+        let resp = call(&f.app, "POST", "/api/fs/upload?path=", Some(&c1), None, Some(&ct), Body::from(body)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (st, v) = post_json(&f.app, "/api/guest/share", Some(&c1), json!({"path": "shared.txt"})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let share_exp = v["data"]["expires_at"].as_str().unwrap();
+        assert!(share_exp > key24_exp.as_str(), "share 的 24h 应晚于先签的 24h 密钥");
+        // share 产生的条目 key_code 为 null
+        let resp = call(&f.app, "GET", "/api/guest/list", Some(&c1), None, None, Body::empty()).await;
+        let v = json_body(resp).await;
+        let share_item = v["data"]["items"].as_array().unwrap().iter()
+            .find(|i| i["orig_name"] == "shared.txt").unwrap();
+        assert_eq!(share_item["key_code"], Value::Null);
     }
 }

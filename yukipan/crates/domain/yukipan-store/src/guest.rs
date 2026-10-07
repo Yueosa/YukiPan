@@ -24,11 +24,15 @@ pub struct GuestRef {
     pub source_ip: IpAddr,
     /// 这条指向的 guest 配额记在谁账上。
     pub charged_to: Uuid,
+    /// 带上来的密钥 (管理员分享为 None)。
+    pub key_id: Option<Uuid>,
+    /// 密钥短码 (联查带出, 管理列表展示用)。
+    pub key_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
-type GuestRow = (
+pub(crate) type GuestRow = (
     Uuid,
     String,
     String,
@@ -36,11 +40,13 @@ type GuestRow = (
     i64,
     IpAddr,
     Uuid,
+    Option<Uuid>,
+    Option<String>,
     DateTime<Utc>,
     DateTime<Utc>,
 );
 
-fn row_to_guest(r: GuestRow) -> GuestRef {
+pub(crate) fn row_to_guest(r: GuestRow) -> GuestRef {
     GuestRef {
         id: r.0,
         public_name: r.1,
@@ -49,14 +55,16 @@ fn row_to_guest(r: GuestRow) -> GuestRef {
         size: r.4 as u64,
         source_ip: r.5,
         charged_to: r.6,
-        created_at: r.7,
-        expires_at: r.8,
+        key_id: r.7,
+        key_code: r.8,
+        created_at: r.9,
+        expires_at: r.10,
     }
 }
 
-const GUEST_SELECT: &str =
-    "SELECT id, public_name, orig_name, sha256, size, source_ip, charged_to, created_at, expires_at
-     FROM guest_refs";
+pub(crate) const GUEST_SELECT: &str =
+    "SELECT g.id, g.public_name, g.orig_name, g.sha256, g.size, g.source_ip, g.charged_to, g.key_id, k.code, g.created_at, g.expires_at
+     FROM guest_refs g LEFT JOIN guest_keys k ON k.id = g.key_id";
 
 impl BlobStore {
     /// 访客配额挂账对象: 最早创建的用户 (单用户应用即管理员)。
@@ -69,7 +77,8 @@ impl BlobStore {
         Ok(row.map(|(id,)| id))
     }
 
-    /// 插一条访客指向。
+    /// 插一条访客指向。`key_id` 是带上来的密钥 (匿名上传必带, 管理员分享为 None);
+    /// `expires_at` 由调用方算好 (密钥上传 = 密钥过期时间, 分享 = now + ttl_hours)。
     pub async fn insert_guest_ref(
         &self,
         public_name: &str,
@@ -78,12 +87,14 @@ impl BlobStore {
         size: u64,
         source_ip: IpAddr,
         charged_to: Uuid,
+        key_id: Option<Uuid>,
         expires_at: DateTime<Utc>,
     ) -> Result<GuestRef> {
         let row = sqlx::query_as::<_, GuestRow>(
-            "INSERT INTO guest_refs (public_name, orig_name, sha256, size, source_ip, charged_to, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING id, public_name, orig_name, sha256, size, source_ip, charged_to, created_at, expires_at",
+            "INSERT INTO guest_refs (public_name, orig_name, sha256, size, source_ip, charged_to, key_id, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING id, public_name, orig_name, sha256, size, source_ip, charged_to, key_id,
+                       NULL::TEXT, created_at, expires_at",
         )
         .bind(public_name)
         .bind(orig_name)
@@ -91,6 +102,7 @@ impl BlobStore {
         .bind(i64::try_from(size).map_err(|_| StoreError::TooLarge)?)
         .bind(source_ip)
         .bind(charged_to)
+        .bind(key_id)
         .bind(expires_at)
         .fetch_one(&self.pool)
         .await
@@ -102,7 +114,10 @@ impl BlobStore {
             }
             StoreError::Db(e)
         })?;
-        Ok(row_to_guest(row))
+        let mut r = row_to_guest(row);
+        // key_code 由 list/联查带出; 插入路径调用方自己拿着 code, 不必再联查。
+        r.key_code = None;
+        Ok(r)
     }
 
     /// 登录管理列表 (访客没有公开整仓列表), offset 分页, 新的在前。
@@ -111,7 +126,7 @@ impl BlobStore {
             .fetch_one(&self.pool)
             .await?;
         let rows = sqlx::query_as::<_, GuestRow>(sql_safe(format!(
-            "{GUEST_SELECT} ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
+            "{GUEST_SELECT} ORDER BY g.created_at DESC, g.id DESC LIMIT $1 OFFSET $2"
         )))
         .bind(i64::from(per_page))
         .bind(i64::from(page.saturating_sub(1)) * i64::from(per_page))
@@ -122,7 +137,7 @@ impl BlobStore {
 
     /// 按 id 取访客指向 (没有返回 None)。
     pub async fn get_guest_ref(&self, id: Uuid) -> Result<Option<GuestRef>> {
-        let row = sqlx::query_as::<_, GuestRow>(sql_safe(format!("{GUEST_SELECT} WHERE id = $1")))
+        let row = sqlx::query_as::<_, GuestRow>(sql_safe(format!("{GUEST_SELECT} WHERE g.id = $1")))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -132,7 +147,7 @@ impl BlobStore {
     /// 按公开名取访客指向 (下载校验/测试用)。
     pub async fn get_guest_ref_by_name(&self, public_name: &str) -> Result<Option<GuestRef>> {
         let row = sqlx::query_as::<_, GuestRow>(sql_safe(format!(
-            "{GUEST_SELECT} WHERE public_name = $1"
+            "{GUEST_SELECT} WHERE g.public_name = $1"
         )))
         .bind(public_name)
         .fetch_optional(&self.pool)
@@ -143,7 +158,7 @@ impl BlobStore {
     /// 删一条访客指向, 返回被删的行 (调用方做盘上/账本/blob 收尾)。
     pub async fn delete_guest_ref(&self, id: Uuid) -> Result<Option<GuestRef>> {
         let row = sqlx::query_as::<_, GuestRow>(sql_safe(format!(
-            "{GUEST_SELECT} WHERE id = $1"
+            "{GUEST_SELECT} WHERE g.id = $1"
         )))
         .bind(id)
         .fetch_optional(&self.pool)
@@ -160,7 +175,7 @@ impl BlobStore {
 
     /// 全量 (一键清空 / 清扫前的枚举)。
     pub async fn list_all_guest_refs(&self) -> Result<Vec<GuestRef>> {
-        let rows = sqlx::query_as::<_, GuestRow>(sql_safe(format!("{GUEST_SELECT} ORDER BY created_at")))
+        let rows = sqlx::query_as::<_, GuestRow>(sql_safe(format!("{GUEST_SELECT} ORDER BY g.created_at")))
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(row_to_guest).collect())
@@ -169,7 +184,7 @@ impl BlobStore {
     /// 到点未清的访客指向 (TTL 清扫用, 文档第 4、6 章)。
     pub async fn list_expired_guest_refs(&self, now: DateTime<Utc>) -> Result<Vec<GuestRef>> {
         let rows = sqlx::query_as::<_, GuestRow>(sql_safe(format!(
-            "{GUEST_SELECT} WHERE expires_at < $1 ORDER BY expires_at"
+            "{GUEST_SELECT} WHERE g.expires_at < $1 ORDER BY g.expires_at"
         )))
         .bind(now)
         .fetch_all(&self.pool)
