@@ -301,7 +301,7 @@ JSON 一律 `{ success, data, message }`, 和 YukiLog 同一套。私有下载/�
 * 解到 `/var/www/yukipan/releases/<版本>/`, 原子切 `current` 软链
 * 切换后 30 秒轮询 `/api/health`, 起不来就自动回滚到上一个 release
 
-首次部署完成后创建第一个管理员用户: `sudo /var/www/yukipan/current/bin/yukipan-server user add <用户名>`, 交互式输两遍密码。私有区和所有管理接口都靠这个账号登录。
+首次部署完成后创建第一个管理员用户: `sudo -u yukipan /var/www/yukipan/current/bin/yukipan-server user add <用户名>`, 交互式输两遍密码。私有区和所有管理接口都靠这个账号登录。
 
 ### 备份与恢复: yukipan-backup / yukipan-restore
 

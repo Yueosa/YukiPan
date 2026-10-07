@@ -70,10 +70,10 @@ sudo yukipan-enable-https
 shell 的 `yukipan` 用户、数据库和随机数据库密码。
 若 `/etc/yukipan/bootstrap.conf` 已经存在，脚本会拒绝覆盖。
 
-首次部署 release 之后，创建第一个管理员用户（交互式输入两遍密码）：
+首次部署 release 之后，创建第一个管理员用户（以 yukipan 身份运行，交互式输入两遍密码）：
 
 ```bash
-sudo /var/www/yukipan/current/bin/yukipan-server user add <用户名>
+sudo -u yukipan /var/www/yukipan/current/bin/yukipan-server user add <用户名>
 ```
 
 ## 发布与回滚

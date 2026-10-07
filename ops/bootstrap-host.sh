@@ -223,7 +223,7 @@ cat <<EOF
 下一步：
 1. 将 release tar.gz 上传到 /var/www/yukipan/incoming/
 2. 运行 sudo yukipan-deploy <release.tar.gz>
-3. 创建第一个管理员用户（交互式设置密码）：
-   sudo /var/www/yukipan/current/bin/yukipan-server user add <用户名>
+3. 创建第一个管理员用户（以 yukipan 身份运行, 交互式设置密码）：
+   sudo -u yukipan /var/www/yukipan/current/bin/yukipan-server user add <用户名>
 4. HTTP 验证正常后运行 sudo yukipan-enable-https${CERT_EMAIL:+ $CERT_EMAIL}。
 EOF
