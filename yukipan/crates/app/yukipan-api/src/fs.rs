@@ -14,12 +14,12 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use yukipan_fs::{DataRoot, LogicalPath};
 use yukipan_store::Space;
 
 use crate::auth::AuthUser;
+use crate::util::{content_length, internal_io, stream_to_tmp};
 use crate::error::ApiError;
 use crate::wire::Envelope;
 use crate::AppState;
@@ -198,7 +198,7 @@ pub async fn upload(
     let tmp_dir = state.blobs.data_root().join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(internal_io)?;
     let tmp = tmp_dir.join(Uuid::new_v4().to_string());
-    let filename = match stream_to_tmp(&mut mp, &tmp).await {
+    let filename = match stream_to_tmp(&mut mp, &tmp, None).await {
         Ok(f) => f,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -383,29 +383,6 @@ async fn finish_upload(
     })
 }
 
-/// 收 multipart 的 `file` 字段流式写进 tmp, 返回声明的文件名。
-async fn stream_to_tmp(mp: &mut Multipart, tmp: &PathBuf) -> Result<Option<String>, ApiError> {
-    let mut file = tokio::fs::File::create(tmp).await.map_err(internal_io)?;
-    while let Some(mut field) = mp.next_field().await.map_err(multipart_err)? {
-        if field.name() != Some("file") {
-            continue;
-        }
-        let filename = field.file_name().map(str::to_owned);
-        loop {
-            match field.chunk().await {
-                Ok(Some(chunk)) => {
-                    file.write_all(&chunk).await.map_err(internal_io)?;
-                }
-                Ok(None) => break,
-                Err(e) => return Err(multipart_err(e)),
-            }
-        }
-        file.flush().await.map_err(internal_io)?;
-        return Ok(Some(filename.ok_or_else(|| ApiError::bad_request("file 字段缺少文件名"))?));
-    }
-    Ok(None)
-}
-
 /// 每用户一个私有根, 首次访问懒建 (避免启动时扫用户表建目录)。
 fn user_root(state: &AppState, uid: Uuid) -> Result<DataRoot, ApiError> {
     let dir = state
@@ -437,13 +414,6 @@ fn join_logical(dir: &LogicalPath, name: &str) -> Result<LogicalPath, ApiError> 
 
 fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
-fn content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
 }
 
 /// 预览 Content-Type 安全映射 (文档第 5 章): 只有图片与 pdf 给真类型。
@@ -509,15 +479,6 @@ async fn rollback_blob(state: &AppState, sha256: &str) {
     if let Err(e) = state.blobs.delete_blob_if_unreferenced(sha256).await {
         eprintln!("回滚清 blob 失败: {e}");
     }
-}
-
-fn multipart_err(e: axum::extract::multipart::MultipartError) -> ApiError {
-    ApiError::bad_request(format!("multipart 解析失败: {}", e.status()))
-}
-
-fn internal_io(e: std::io::Error) -> ApiError {
-    eprintln!("io error: {e}");
-    ApiError::Internal("内部错误".into())
 }
 
 #[cfg(test)]

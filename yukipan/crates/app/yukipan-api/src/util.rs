@@ -1,0 +1,63 @@
+//! 上传共用小件: multipart 流式落 tmp、Content-Length、错误映射 (私有区与图床共用)。
+
+use std::path::Path;
+
+use axum::extract::Multipart;
+use axum::http::{HeaderMap, header};
+use tokio::io::AsyncWriteExt;
+
+use crate::error::ApiError;
+
+/// 收 multipart 的 `file` 字段流式写进 tmp, 返回声明的文件名。
+/// `max_bytes` 给上限 (图床单文件 20MB 这档): 写超就中止报 413,
+/// 不等收完 — 上传内存与 tmp 占用都有界 (文档第 1、2 章)。
+pub async fn stream_to_tmp(
+    mp: &mut Multipart,
+    tmp: &Path,
+    max_bytes: Option<u64>,
+) -> Result<Option<String>, ApiError> {
+    let mut file = tokio::fs::File::create(tmp).await.map_err(internal_io)?;
+    while let Some(mut field) = mp.next_field().await.map_err(multipart_err)? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = field.file_name().map(str::to_owned);
+        let mut written = 0u64;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    written += chunk.len() as u64;
+                    if let Some(max) = max_bytes
+                        && written > max
+                    {
+                        return Err(ApiError::too_large("单文件超过大小上限"));
+                    }
+                    file.write_all(&chunk).await.map_err(internal_io)?;
+                }
+                Ok(None) => break,
+                Err(e) => return Err(multipart_err(e)),
+            }
+        }
+        file.flush().await.map_err(internal_io)?;
+        return Ok(Some(
+            filename.ok_or_else(|| ApiError::bad_request("file 字段缺少文件名"))?,
+        ));
+    }
+    Ok(None)
+}
+
+pub fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
+pub fn multipart_err(e: axum::extract::multipart::MultipartError) -> ApiError {
+    ApiError::bad_request(format!("multipart 解析失败: {}", e.status()))
+}
+
+pub fn internal_io(e: std::io::Error) -> ApiError {
+    eprintln!("io error: {e}");
+    ApiError::Internal("内部错误".into())
+}

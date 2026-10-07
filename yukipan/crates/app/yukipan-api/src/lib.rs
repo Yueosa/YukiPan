@@ -3,6 +3,8 @@
 mod auth;
 mod error;
 pub mod fs;
+pub mod images;
+mod util;
 mod wire;
 
 use axum::extract::DefaultBodyLimit;
@@ -43,6 +45,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fs/instant", post(fs::instant))
         .route("/api/fs/download", get(fs::download))
         .route("/api/fs/preview", get(fs::preview))
+        // 图床: 公开读
+        .route("/api/albums", get(images::list_albums))
+        .route("/api/images/list", get(images::list_images))
+        .route("/api/tags", get(images::list_tags))
+        // 图床: 登录管理
+        .route("/api/albums", post(images::create_album))
+        .route("/api/albums/delete", post(images::delete_album))
+        .route(
+            "/api/images/upload",
+            post(images::upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/images/instant", post(images::instant))
+        .route("/api/images/delete", post(images::delete_image))
+        .route("/api/images/tags", post(images::set_tags))
+        .route("/api/images/share", post(images::share))
         .with_state(state)
 }
 
@@ -117,6 +134,51 @@ mod tests {
             json(resp).await,
             serde_json::json!({"success": false, "data": null, "message": "用户名和密码不能为空"})
         );
+    }
+
+    /// 私有区 8 端点无 cookie 一律 401 (鉴权提取器最先跑, 不碰库不碰盘)。
+    /// 图床管理端点无 cookie 一律 401; 公开端点 (albums/images/tags) 不在此列。
+    #[tokio::test]
+    async fn image_admin_routes_require_login() {
+        let cases: Vec<(&str, &str, Body)> = vec![
+            ("POST", "/api/albums", Body::from(r#"{"name":"a"}"#)),
+            (
+                "POST",
+                "/api/albums/delete",
+                Body::from(r#"{"id":"00000000-0000-0000-0000-000000000000"}"#),
+            ),
+            ("POST", "/api/images/upload", Body::empty()),
+            (
+                "POST",
+                "/api/images/instant",
+                Body::from(r#"{"name":"a.png","sha256":"x","size":1}"#),
+            ),
+            (
+                "POST",
+                "/api/images/delete",
+                Body::from(r#"{"id":"00000000-0000-0000-0000-000000000000"}"#),
+            ),
+            (
+                "POST",
+                "/api/images/tags",
+                Body::from(r#"{"id":"00000000-0000-0000-0000-000000000000","tags":[]}"#),
+            ),
+            ("POST", "/api/images/share", Body::from(r#"{"path":"a.png"}"#)),
+        ];
+        for (method, uri, body) in cases {
+            let resp = router(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
     }
 
     /// 私有区 8 端点无 cookie 一律 401 (鉴权提取器最先跑, 不碰库不碰盘)。

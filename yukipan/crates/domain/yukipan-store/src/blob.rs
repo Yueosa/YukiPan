@@ -91,6 +91,38 @@ impl BlobStore {
         Ok(yes)
     }
 
+    /// 秒传放行判据的宽口径 (图床用, 文档第 6 章): 私有区或图床任一指向都算
+    /// 「已持有」— 把私有文件秒传到图床等于主动公开, 允许。
+    pub async fn user_has_any_ref(&self, user_id: Uuid, sha256: &str) -> Result<bool> {
+        let (yes,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM private_refs WHERE user_id = $1 AND sha256 = $2)
+                 OR EXISTS(SELECT 1 FROM image_refs i JOIN albums a ON a.id = i.album_id
+                           WHERE a.user_id = $1 AND i.sha256 = $2)",
+        )
+        .bind(user_id)
+        .bind(sha256)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(yes)
+    }
+
+    /// 取某逻辑路径的私有区指向 (hash + 大小), 没有返回 None (分享到图床/访客用)。
+    pub async fn get_private_ref(
+        &self,
+        user_id: Uuid,
+        path: &LogicalPath,
+    ) -> Result<Option<(String, u64)>> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT r.sha256, b.size FROM private_refs r JOIN blobs b ON b.sha256 = r.sha256
+             WHERE r.user_id = $1 AND r.path = $2",
+        )
+        .bind(user_id)
+        .bind(path.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(sha, size)| (sha, size as u64)))
+    }
+
     /// 移动/改名后同步指向路径 (文档第 6 章: 文件落盘写指向, 路径是指向的一部分)。
     /// `from` 是文件时只改那一行; 是目录时其下所有指向按前缀平移。
     /// 用 starts_with 而不是 LIKE: 路径里 `%`/`_` 是合法文件名字符, LIKE 会误配。
@@ -294,15 +326,18 @@ impl BlobStore {
         Ok(row.map(|(sha,)| sha))
     }
 
-    /// 引用计数: 还指着这个 hash 的指向行数。
+    /// 引用计数: 还指着这个 hash 的指向行数 = private_refs + image_refs 之和
+    /// (文档第 6 章: 三个空间都不要了, 磁盘才真正丢掉)。
     ///
-    /// 扩展点 (切片 3/4): 当前只数 private_refs; 图床 (image_refs) 与访客
-    /// (guest_refs) 指向表落地后, 这里要改成三表计数之和, 删除判据同步生效。
+    /// 扩展点 (切片 4): 访客 (guest_refs) 指向表落地后并入求和, 删除判据同步生效。
     pub async fn blob_ref_count(&self, sha256: &str) -> Result<u64> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM private_refs WHERE sha256 = $1")
-            .bind(sha256)
-            .fetch_one(&self.pool)
-            .await?;
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM private_refs WHERE sha256 = $1)
+                  + (SELECT COUNT(*) FROM image_refs WHERE sha256 = $1)",
+        )
+        .bind(sha256)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(n as u64)
     }
 
@@ -314,14 +349,15 @@ impl BlobStore {
     /// 不挡任何读, 且同内容下次收编会因盘上已存在直接复用 (自愈)。文件删除失败
     /// 仅告警, 不当错误抛出。
     ///
-    /// 竞态: 并发的 add_private_ref 会对 blobs 行加 FOR KEY SHARE 锁, 与本 DELETE
+    /// 竞态: 并发的新指向 (任一指向表) 会对 blobs 行加 FOR KEY SHARE 锁, 与本 DELETE
     /// 互斥 — 要么它先提交 (NOT EXISTS 重估后本删除放弃), 要么本删除先提交
     /// (它的 INSERT 撞外键)。不会出现「删了文件还有指向」。
     pub async fn delete_blob_if_unreferenced(&self, sha256: &str) -> Result<bool> {
         let done = sqlx::query(
             "DELETE FROM blobs b
              WHERE b.sha256 = $1
-               AND NOT EXISTS (SELECT 1 FROM private_refs r WHERE r.sha256 = b.sha256)",
+               AND NOT EXISTS (SELECT 1 FROM private_refs r WHERE r.sha256 = b.sha256)
+               AND NOT EXISTS (SELECT 1 FROM image_refs i WHERE i.sha256 = b.sha256)",
         )
         .bind(sha256)
         .execute(&self.pool)

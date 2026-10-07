@@ -60,6 +60,11 @@ impl From<StoreError> for ApiError {
             StoreError::BlobNotFound => Self::not_found("内容不存在"),
             StoreError::QuotaExceeded => Self::too_large("空间配额不足"),
             StoreError::DiskReserve { .. } => Self::too_large("磁盘可用空间不足"),
+            StoreError::AlbumNameTaken => Self::conflict("相册名已存在"),
+            StoreError::AlbumNotFound => Self::not_found("相册不存在"),
+            StoreError::AlbumNotEmpty => Self::conflict("相册非空, 请先移走其中的图"),
+            StoreError::DefaultAlbumForbidden => Self::bad_request("默认相册不能删除"),
+            StoreError::ImageNotFound => Self::not_found("图片不存在"),
             other => {
                 eprintln!("store error: {other}");
                 Self::Internal("内部错误".into())

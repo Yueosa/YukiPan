@@ -5,9 +5,11 @@
 //! ([`Space`], 方法在 [`Store`] / [`BlobStore`] 上)。
 
 mod blob;
+mod image;
 mod quota;
 
-pub use blob::{BlobStore, IngestOutcome};
+pub use blob::{BlobStore, IngestOutcome, PrivateRef};
+pub use image::{Album, AlbumSummary, ImageRef, TagSummary, normalize_tag_name};
 pub use quota::Space;
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -69,6 +71,21 @@ pub enum StoreError {
     /// 文件大小超出数据库 BIGINT 可表达范围 (实际不可能达到, 兜底)。
     #[error("文件大小超出可存储范围")]
     TooLarge,
+    /// 建相册时重名 (每用户名唯一)。
+    #[error("相册名已存在")]
+    AlbumNameTaken,
+    /// 相册不存在 (或不属于当前用户)。
+    #[error("相册不存在")]
+    AlbumNotFound,
+    /// 删相册时册里还有图。
+    #[error("相册非空")]
+    AlbumNotEmpty,
+    /// 默认相册不允许删除。
+    #[error("默认相册不允许删除")]
+    DefaultAlbumForbidden,
+    /// 图片指向不存在 (或不属于当前用户)。
+    #[error("图片不存在")]
+    ImageNotFound,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
