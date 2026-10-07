@@ -85,6 +85,9 @@ pub struct InstantReq {
 #[derive(Debug, Deserialize)]
 pub struct FileQuery {
     path: Option<String>,
+    /// dev 环境 (vite 无 nginx): 带 `?direct=1` 时后端直接流式回文件,
+    /// 不回 X-Accel-Redirect。生产 nginx 出文件, 前端不带此参数。
+    direct: Option<String>,
 }
 
 /// `GET /api/fs/list?path=` — 不递归, 目录在前。
@@ -278,12 +281,13 @@ pub async fn instant(
 }
 
 /// `GET /api/fs/download?path=` — 鉴权后内部重定向, 附件下载 (文档第 7 章)。
+/// `?direct=1` (仅 dev): 后端直接流式回文件体。
 pub async fn download(
     user: AuthUser,
     State(state): State<AppState>,
     Query(q): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
-    serve_file(&state, user.0.id, q.path.as_deref(), false)
+    serve_file(&state, user.0.id, q.path.as_deref(), false, is_direct(&q)).await
 }
 
 /// `GET /api/fs/preview?path=` — 页内预览。Content-Type 按扩展名安全映射:
@@ -294,16 +298,22 @@ pub async fn preview(
     State(state): State<AppState>,
     Query(q): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
-    serve_file(&state, user.0.id, q.path.as_deref(), true)
+    serve_file(&state, user.0.id, q.path.as_deref(), true, is_direct(&q)).await
+}
+
+fn is_direct(q: &FileQuery) -> bool {
+    q.direct.as_deref() == Some("1")
 }
 
 /// download/preview 共用: 鉴权过 → X-Accel-Redirect 到 nginx 的 /protected/,
 /// body 由 nginx 直出, 不过后端内存 (文档第 2、8 章)。
-fn serve_file(
+/// direct=1 时改走后端流式直出 (dev 无 nginx 场景), 分块经通道送出, 不整读内存。
+async fn serve_file(
     state: &AppState,
     uid: Uuid,
     raw_path: Option<&str>,
     inline: bool,
+    direct: bool,
 ) -> Result<Response, ApiError> {
     let path = parse_path(raw_path)?;
     if path.is_root() {
@@ -319,8 +329,6 @@ fn serve_file(
         return Err(ApiError::bad_request("不能下载目录"));
     }
     let name = path.file_name().expect("非根路径必有文件名");
-    // 路径逐分量百分号编码: 中文等非 ASCII 名字不能直接进响应头。
-    let redirect = format!("/protected/{uid}/{}", encode_logical_path(&path));
     let (content_type, disposition) = if inline {
         (preview_content_type(name), "inline".to_string())
     } else {
@@ -329,12 +337,55 @@ fn serve_file(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header("X-Accel-Redirect", redirect)
         .header("Content-Disposition", disposition);
     if inline {
         builder = builder.header("X-Content-Type-Options", "nosniff");
     }
-    Ok(builder.body(Body::empty()).expect("响应构造失败"))
+    if direct {
+        let body = direct_body(&abs, meta.len()).await?;
+        return Ok(builder
+            .header(header::CONTENT_LENGTH, meta.len())
+            .body(body)
+            .expect("响应构造失败"));
+    }
+    // 路径逐分量百分号编码: 中文等非 ASCII 名字不能直接进响应头。
+    let redirect = format!("/protected/{uid}/{}", encode_logical_path(&path));
+    Ok(builder
+        .header("X-Accel-Redirect", redirect)
+        .body(Body::empty())
+        .expect("响应构造失败"))
+}
+
+/// direct 直出: tokio 分块读文件, 经有界通道喂给 Body (背压: 通道满则读盘挂起),
+/// 全程不整读内存。Receiver 实现 Stream, Body::from_stream 直接吃。
+async fn direct_body(abs: &PathBuf, size: u64) -> Result<Body, ApiError> {
+    let mut file = tokio::fs::File::open(abs).await.map_err(|e| {
+        error!("direct 打开文件失败: {e}");
+        ApiError::Internal("内部错误".into())
+    })?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(2);
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut left = size;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            match file.read(&mut buf[..want]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    left -= n as u64;
+                    if tx.send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                        break; // 客户端断开, 停止读盘
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+    Ok(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
 }
 
 /// ingest 之后的收尾链: 记账 → 建链接 → 写指向, 步步带反向回滚。
@@ -842,5 +893,59 @@ mod db_tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         let (st, _) = upload(&f.app, &c, "", "b.bin", &b[..900]).await;
         assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    #[ignore = "需要真实 PostgreSQL, 设 YUKIPAN_TEST_DB_URL 后加 --ignored 跑"]
+    async fn download_preview_direct_streams_bytes() {
+        let f = fixture("").await;
+        let tag = Uuid::new_v4();
+        f.state
+            .store
+            .create_user(&format!("td-{tag}"), "pw")
+            .await
+            .unwrap();
+        let c = login(&f.app, &format!("td-{tag}"), "pw").await;
+
+        // 造一个 > 64KB 的文件, 跨 direct 的分块边界 (内容带 run 唯一后缀)
+        let mut content = Vec::new();
+        while content.len() < 200_000 {
+            content.extend_from_slice(tag.to_string().as_bytes());
+        }
+        let (st, v) = upload(&f.app, &c, "", "big.txt", &content).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+
+        // direct 下载: 无 X-Accel 头, 字节流原样回来, Content-Length/Disposition 不变
+        let resp = call(&f.app, "GET", "/api/fs/download?path=big.txt&direct=1", Some(&c), None, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-accel-redirect").is_none());
+        assert_eq!(
+            resp.headers().get("content-length").unwrap().to_str().unwrap(),
+            content.len().to_string()
+        );
+        let disp = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+        assert!(disp.starts_with("attachment") && disp.contains("filename*=UTF-8''big.txt"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], &content[..]);
+
+        // direct 预览: Content-Type/nosniff 规则不变, 字节一致
+        let resp = call(&f.app, "GET", "/api/fs/preview?path=big.txt&direct=1", Some(&c), None, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-accel-redirect").is_none());
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(resp.headers().get("x-content-type-options").unwrap(), "nosniff");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], &content[..]);
+
+        // 不带 direct: 仍是 X-Accel 内部重定向 (生产路径不受影响)
+        let resp = call(&f.app, "GET", "/api/fs/download?path=big.txt", Some(&c), None, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-accel-redirect").is_some());
+        // direct 值不是 1 也走 X-Accel
+        let resp = call(&f.app, "GET", "/api/fs/download?path=big.txt&direct=0", Some(&c), None, Body::empty()).await;
+        assert!(resp.headers().get("x-accel-redirect").is_some());
     }
 }

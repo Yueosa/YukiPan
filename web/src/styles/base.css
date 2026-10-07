@@ -1,0 +1,246 @@
+/* YukiPan 全局基调 — 延续 Yukikoi 的暖纸感: 纸底、墨字、朱红点缀、衬线标题、细线、mono 小标签 */
+:root {
+  --paper: #f3efe7;
+  --paper-raised: #faf7f0;
+  --ink: #181712;
+  --red: #e43c4a;
+  --blue: #3453f4;
+  --soft: #d7d0c3;
+  --softer: #e6e0d3;
+  --muted: #777064;
+
+  --font-serif: "Noto Serif SC", "Songti SC", Georgia, serif;
+  --font-display: Georgia, "Noto Serif SC", serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ease-out: cubic-bezier(.17, .79, .2, 1);
+  --topbar-height: 61px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-serif);
+  scrollbar-gutter: stable;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  min-height: 100vh;
+}
+
+h1, h2, h3, p, ul, ol, figure {
+  margin: 0;
+}
+
+ul, ol {
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  color: inherit;
+  font: inherit;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+/* ---------- 共用元件 ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border: 1px solid var(--ink);
+  background: transparent;
+  font-size: 13px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: color .25s var(--ease-out), border-color .25s var(--ease-out), background .25s var(--ease-out), opacity .25s;
+  user-select: none;
+}
+
+.btn:hover {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.btn:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+  color: inherit;
+  border-color: var(--soft);
+}
+
+.btn--primary {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.btn--primary:hover {
+  background: var(--red);
+  border-color: var(--red);
+  color: var(--paper);
+}
+
+.btn--small {
+  padding: 4px 9px;
+  font-size: 12px;
+}
+
+.btn--ghost {
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.btn--ghost:hover {
+  border-color: var(--red);
+}
+
+.btn--danger:hover {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(228, 60, 74, .06);
+}
+
+.input {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--soft);
+  background: var(--paper-raised);
+  color: var(--ink);
+  font: 14px var(--font-serif);
+  transition: border-color .25s var(--ease-out);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--ink);
+}
+
+.input::placeholder {
+  color: var(--muted);
+  opacity: .7;
+}
+
+.card {
+  background: var(--paper-raised);
+  border: 1px solid var(--soft);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .02em;
+}
+
+/* 细轨道进度条 (Yukikoi 风) */
+.rail {
+  height: 2px;
+  overflow: hidden;
+  background: var(--soft);
+}
+
+.rail__fill {
+  display: block;
+  height: 100%;
+  background: var(--red);
+  transform: scaleX(var(--p, 0));
+  transform-origin: left;
+  transition: transform .3s var(--ease-out), background .3s;
+  will-change: transform;
+}
+
+/* 标签 chip */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 11px;
+  border: 1px solid var(--soft);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .25s var(--ease-out);
+}
+
+.chip:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.chip--active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
+}
+
+/* 页面容器 */
+.page {
+  width: min(1080px, 94vw);
+  margin: 0 auto;
+  padding: 36px 0 80px;
+}
+
+.page-title {
+  font: 900 1.6rem var(--font-display);
+  letter-spacing: -.02em;
+}
+
+/* 通用淡入 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity .25s var(--ease-out);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.pop-enter-active {
+  transition: opacity .3s var(--ease-out), transform .3s var(--ease-out);
+}
+
+.pop-leave-active {
+  transition: opacity .15s ease-in, transform .15s ease-in;
+}
+
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(10px) scale(.985);
+}
+
+@media (max-width: 720px) {
+  .page {
+    padding-top: 24px;
+  }
+}
