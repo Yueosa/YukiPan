@@ -1,0 +1,38 @@
+[Unit]
+Description=YukiPan server
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yukipan
+Group=yukipan
+WorkingDirectory=/var/www/yukipan/current
+Environment=YUKIPAN_CONFIG=/etc/yukipan/config.toml
+ExecStart=/var/www/yukipan/current/bin/yukipan-server
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0027
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/www/yukipan
+ReadWritePaths=/var/lib/yukipan
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

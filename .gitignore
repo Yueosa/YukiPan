@@ -8,8 +8,7 @@ dist/
 .vite/
 *.local
 
-# 机器上的常量, 只提交 example
-yukipan.env
+# 机器上的配置, 只提交 example
 .env
 config.dev.toml
 
@@ -21,3 +20,7 @@ config.dev.toml
 .idea/
 *.swp
 .DS_Store
+
+# 部署演练与 release 构建产物
+.rehearsal/
+.release-build/

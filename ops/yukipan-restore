@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# YukiPan 恢复：先把 dump 导入临时数据库，成功后停服务原子交换库名；
+# 旧库保留。数据目录仅 --with-data 时恢复（同样先暂存再交换，旧数据保留）。
+# 用法：yukipan-restore <备份ID> --confirm-restore [--with-data]
+
+set -Eeuo pipefail
+umask 077
+
+readonly BACKUP_ID="${1:-}"
+readonly CONFIRM="${2:-}"
+readonly WITH_DATA_ARG="${3:-}"
+readonly BACKUP_ROOT="/var/backups/yukipan"
+readonly DATA_ROOT="/var/lib/yukipan"
+readonly BACKUP="$BACKUP_ROOT/$BACKUP_ID"
+
+[[ $EUID -eq 0 ]] || { echo "请以 root 运行" >&2; exit 1; }
+[[ "$BACKUP_ID" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9]{9})?$ ]] \
+    || { echo "用法：yukipan-restore <备份ID> --confirm-restore [--with-data]" >&2; exit 2; }
+[[ "$CONFIRM" == "--confirm-restore" ]] \
+    || { echo "恢复会替换当前数据库，请显式确认" >&2; exit 2; }
+
+WITH_DATA=false
+case "$WITH_DATA_ARG" in
+    "") ;;
+    --with-data) WITH_DATA=true ;;
+    *) echo "用法：yukipan-restore <备份ID> --confirm-restore [--with-data]" >&2; exit 2 ;;
+esac
+readonly WITH_DATA
+
+[[ -d "$BACKUP" ]] || { echo "备份不存在：$BACKUP" >&2; exit 1; }
+
+(
+    cd "$BACKUP"
+    sha256sum --check MANIFEST.sha256
+)
+
+if [[ "$WITH_DATA" == true && ! -f "$BACKUP/data.tar.gz" ]]; then
+    echo "该备份不含数据目录（备份时未加 --with-data）" >&2
+    exit 1
+fi
+
+readonly RESTORE_DB="yukipan_restore_${BACKUP_ID//[^0-9A-Za-z]/_}"
+readonly OLD_DB="yukipan_before_${BACKUP_ID//[^0-9A-Za-z]/_}"
+readonly DATA_STAGE="$DATA_ROOT/.data-restore-$BACKUP_ID"
+readonly DATA_OLD="$DATA_ROOT/data-before-$BACKUP_ID"
+
+[[ ! -e "$DATA_OLD" ]] || { echo "保留目录已存在：$DATA_OLD" >&2; exit 1; }
+if runuser -u postgres -- psql -tAc \
+    "SELECT 1 FROM pg_database WHERE datname = '$OLD_DB'" | grep -qx '1'; then
+    echo "保留数据库已存在：$OLD_DB" >&2
+    exit 1
+fi
+runuser -u postgres -- dropdb --if-exists "$RESTORE_DB"
+runuser -u postgres -- createdb --owner=yukipan "$RESTORE_DB"
+# The backup directory is intentionally root-only because it also contains
+# config.toml. Open the dump as root, then pass the read-only descriptor to
+# pg_restore running as the database owner so restored objects remain owned by
+# the application role even though the dump deliberately contains no owners.
+if ! runuser -u yukipan -- pg_restore \
+    --exit-on-error --no-owner --no-acl \
+    --dbname="$RESTORE_DB" < "$BACKUP/database.dump"; then
+    runuser -u postgres -- dropdb --if-exists "$RESTORE_DB"
+    exit 1
+fi
+
+if [[ "$WITH_DATA" == true ]]; then
+    rm -rf -- "$DATA_STAGE"
+    mkdir -m 700 "$DATA_STAGE"
+    tar -C "$DATA_STAGE" -xzf "$BACKUP/data.tar.gz"
+    for dir in blobs private public; do
+        [[ -d "$DATA_STAGE/$dir" ]] \
+            || { echo "数据备份结构无效：缺少 $dir" >&2; exit 1; }
+    done
+fi
+
+systemctl stop yukipan-server.service
+runuser -u postgres -- psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+    --set=restore_db="$RESTORE_DB" <<'SQL'
+SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+ WHERE datname IN ('yukipan', :'restore_db')
+   AND pid <> pg_backend_pid();
+SQL
+
+runuser -u postgres -- psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+    --set=old_db="$OLD_DB" <<'SQL'
+ALTER DATABASE yukipan RENAME TO :"old_db";
+SQL
+if ! runuser -u postgres -- psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+    --set=restore_db="$RESTORE_DB" <<'SQL'
+ALTER DATABASE :"restore_db" RENAME TO yukipan;
+SQL
+then
+    warn="临时数据库切换失败"
+    if runuser -u postgres -- psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+        --set=old_db="$OLD_DB" <<'SQL'
+ALTER DATABASE :"old_db" RENAME TO yukipan;
+SQL
+    then
+        systemctl reset-failed yukipan-server.service 2>/dev/null || true
+        systemctl start yukipan-server.service
+        echo "$warn；已恢复原数据库" >&2
+    else
+        echo "$warn，且原数据库自动复原失败；请立即人工处理" >&2
+    fi
+    exit 1
+fi
+
+if [[ "$WITH_DATA" == true ]]; then
+    mkdir -m 700 "$DATA_OLD"
+    for dir in blobs private public; do
+        mv -- "$DATA_ROOT/$dir" "$DATA_OLD/$dir"
+        mv -- "$DATA_STAGE/$dir" "$DATA_ROOT/$dir"
+    done
+    chown -R yukipan:yukipan "$DATA_ROOT/blobs" "$DATA_ROOT/private" "$DATA_ROOT/public"
+    rm -rf -- "$DATA_STAGE"
+fi
+
+systemctl reset-failed yukipan-server.service 2>/dev/null || true
+systemctl start yukipan-server.service
+
+if [[ "$WITH_DATA" == true ]]; then
+    printf '恢复完成。旧数据库保留为 %s，旧数据保留在 %s\n' "$OLD_DB" "$DATA_OLD"
+else
+    printf '恢复完成。旧数据库保留为 %s（数据目录未动）\n' "$OLD_DB"
+fi

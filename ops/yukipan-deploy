@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# YukiPan 发布部署：校验 release、备份、原子切换 current、健康检查与回滚。
+# 用法：yukipan-deploy <release.tar.gz>（需同名 .sha256 在旁边）
+
+set -Eeuo pipefail
+umask 027
+
+readonly ARCHIVE="${1:-}"
+readonly BASE="/var/www/yukipan"
+readonly RELEASES="$BASE/releases"
+readonly CURRENT="$BASE/current"
+readonly CONFIG_FILE="/etc/yukipan/config.toml"
+readonly LOCK_FILE="/run/lock/yukipan-deploy.lock"
+
+[[ $EUID -eq 0 ]] || { echo "请以 root 运行" >&2; exit 1; }
+[[ -f "$ARCHIVE" ]] || { echo "用法：yukipan-deploy <release.tar.gz>" >&2; exit 2; }
+[[ -f "$ARCHIVE.sha256" ]] || { echo "缺少 $ARCHIVE.sha256" >&2; exit 1; }
+[[ -r "$CONFIG_FILE" ]] || { echo "缺少 $CONFIG_FILE" >&2; exit 1; }
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || { echo "另一个 YukiPan 部署正在运行" >&2; exit 1; }
+
+(
+    cd "$(dirname "$ARCHIVE")"
+    sha256sum --check "$(basename "$ARCHIVE").sha256"
+)
+
+while IFS= read -r entry; do
+    [[ "$entry" != /* && "$entry" != *"/../"* && "$entry" != "../"* ]] \
+        || { echo "发布包包含不安全路径：$entry" >&2; exit 1; }
+done < <(tar -tzf "$ARCHIVE")
+
+readonly STAGE="$RELEASES/.incoming-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -p -m 755 "$RELEASES"
+mkdir -m 755 "$STAGE"
+trap 'rm -rf -- "$STAGE"' EXIT
+tar -C "$STAGE" -xzf "$ARCHIVE"
+
+readonly VERSION="$(tr -d '\r\n' < "$STAGE/RELEASE")"
+[[ "$VERSION" =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{7,40}$ ]] \
+    || { echo "发布版本号无效" >&2; exit 1; }
+readonly RELEASE="$RELEASES/$VERSION"
+[[ ! -e "$RELEASE" ]] || { echo "版本已经存在：$VERSION" >&2; exit 1; }
+
+(
+    cd "$STAGE"
+    sha256sum --check MANIFEST.sha256
+)
+[[ -x "$STAGE/bin/yukipan-server" ]] \
+    || { echo "缺少可执行文件：yukipan-server" >&2; exit 1; }
+# 前端未定档：有 web/index.html 就直出静态页，没有仅告警（nginx 会对 / 返回 404）
+[[ -f "$STAGE/web/index.html" ]] \
+    || echo "警告：发布包不含 web/index.html，前端静态页缺失" >&2
+nginx -t
+
+mv -- "$STAGE" "$RELEASE"
+trap - EXIT
+chown -R root:root "$RELEASE"
+chmod -R a-w "$RELEASE"
+
+/usr/local/sbin/yukipan-backup
+
+# YukiPan 尚无独立 migration 步骤（后端在写，schema 由应用自身管理）；
+# 若将来引入迁移工具，在此对新 release 执行迁移，位置与 YukiLog 一致。
+
+PREVIOUS=""
+if [[ -L "$CURRENT" ]]; then
+    PREVIOUS="$(readlink -f -- "$CURRENT" 2>/dev/null || true)"
+    [[ -n "$PREVIOUS" && -d "$PREVIOUS" && "$PREVIOUS" == "$RELEASES/"* ]] \
+        || { echo "current 不是有效的 release 链接" >&2; exit 1; }
+elif [[ -e "$CURRENT" ]]; then
+    echo "current 存在但不是符号链接，拒绝覆盖" >&2
+    exit 1
+fi
+readonly PREVIOUS
+ln -s "$RELEASE" "$BASE/.current-$VERSION"
+mv -Tf "$BASE/.current-$VERSION" "$CURRENT"
+
+rollback_release() {
+    if [[ -n "$PREVIOUS" && -d "$PREVIOUS" ]]; then
+        ln -s "$PREVIOUS" "$BASE/.rollback-current"
+        mv -Tf "$BASE/.rollback-current" "$CURRENT"
+        systemctl reset-failed yukipan-server.service
+        systemctl restart yukipan-server.service
+        echo "应用切换失败，已恢复上一版本：$PREVIOUS" >&2
+    else
+        rm -f -- "$CURRENT"
+        systemctl stop yukipan-server.service 2>/dev/null || true
+        systemctl reset-failed yukipan-server.service 2>/dev/null || true
+        echo "首次应用切换失败，已移除无效 current 链接" >&2
+    fi
+}
+
+systemctl enable yukipan-server.service
+systemctl reset-failed yukipan-server.service 2>/dev/null || true
+systemctl restart yukipan-server.service
+
+healthy=false
+for _ in {1..30}; do
+    if curl --fail --silent \
+        http://127.0.0.1:8516/api/health >/dev/null; then
+        healthy=true
+        break
+    fi
+    if [[ "$(systemctl show yukipan-server.service \
+        --property=Result --value)" != "success" ]]; then
+        break
+    fi
+    sleep 1
+done
+
+if [[ "$healthy" != true ]]; then
+    journalctl -u yukipan-server.service --no-pager -n 50 >&2 || true
+    rollback_release
+    exit 1
+fi
+
+systemctl reload nginx
+printf 'YukiPan 已切换到 %s\n' "$VERSION"

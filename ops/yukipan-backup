@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# YukiPan 备份：PostgreSQL custom dump + 配置副本 + release 路径 + 校验清单。
+# 默认不备份 /var/lib/yukipan 数据（20G 量级）；--with-data 才打数据 tar。
+# 用法：yukipan-backup [--with-data]
+
+set -Eeuo pipefail
+umask 077
+
+readonly CONFIG_FILE="/etc/yukipan/config.toml"
+readonly BOOTSTRAP_CONF="/etc/yukipan/bootstrap.conf"
+readonly BACKUP_ROOT="/var/backups/yukipan"
+readonly DATA_ROOT="/var/lib/yukipan"
+readonly RELEASE_LINK="/var/www/yukipan/current"
+
+[[ $EUID -eq 0 ]] || { echo "请以 root 运行" >&2; exit 1; }
+[[ -r "$CONFIG_FILE" ]] || { echo "缺少 $CONFIG_FILE" >&2; exit 1; }
+
+WITH_DATA=false
+case "${1:-}" in
+    "") ;;
+    --with-data) WITH_DATA=true ;;
+    *) echo "用法：yukipan-backup [--with-data]" >&2; exit 2 ;;
+esac
+readonly WITH_DATA
+
+# 配置由 bootstrap 生成，database_url 是单行双引号字符串
+DATABASE_URL="$(sed -n \
+    's/^database_url[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+    "$CONFIG_FILE" | head -n 1)"
+[[ -n "$DATABASE_URL" ]] || { echo "config.toml 中缺少 database_url" >&2; exit 1; }
+readonly DATABASE_URL
+
+# Nanoseconds prevent two sequential deployments in the same second from
+# selecting the same backup directory.
+readonly BACKUP_ID="$(date -u +%Y%m%dT%H%M%SZ-%N)"
+readonly STAGE="$BACKUP_ROOT/.${BACKUP_ID}.partial"
+readonly FINAL="$BACKUP_ROOT/$BACKUP_ID"
+
+mkdir -p -m 700 "$BACKUP_ROOT"
+[[ ! -e "$FINAL" && ! -e "$STAGE" ]] || { echo "备份 ID 已存在" >&2; exit 1; }
+mkdir -m 700 "$STAGE"
+trap 'rm -rf -- "$STAGE"' EXIT
+
+pg_dump --format=custom --no-owner --no-acl \
+    --file="$STAGE/database.dump" "$DATABASE_URL"
+install -m 600 "$CONFIG_FILE" "$STAGE/config.toml"
+[[ ! -f "$BOOTSTRAP_CONF" ]] \
+    || install -m 600 "$BOOTSTRAP_CONF" "$STAGE/bootstrap.conf"
+if ! readlink -f "$RELEASE_LINK" > "$STAGE/release-path"; then
+    printf 'none\n' > "$STAGE/release-path"
+fi
+
+manifest_files=(database.dump config.toml release-path)
+[[ ! -f "$STAGE/bootstrap.conf" ]] || manifest_files+=(bootstrap.conf)
+
+# 数据根内的 blobs/private/public 互为 hardlink，同一 tar 内会保留链接关系；
+# tmp 是未收编的上传暂存，不进备份
+if [[ "$WITH_DATA" == true ]]; then
+    tar -C "$DATA_ROOT" -czf "$STAGE/data.tar.gz" blobs private public
+    manifest_files+=(data.tar.gz)
+fi
+
+(
+    cd "$STAGE"
+    sha256sum "${manifest_files[@]}" > MANIFEST.sha256
+)
+
+mv -- "$STAGE" "$FINAL"
+trap - EXIT
+printf '备份已创建：%s%s\n' "$FINAL" "$([[ "$WITH_DATA" == true ]] && printf '（含数据目录）')"
