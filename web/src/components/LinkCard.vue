@@ -1,9 +1,10 @@
 <script setup>
 // 链接卡片: 访客上传成功 / 分享到访客 后展示 — 链接 + 一键复制 + 过期倒计时 + 醒目提醒
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed } from 'vue'
 import Icon from './Icon.vue'
+import Countdown from './Countdown.vue'
 import { absoluteUrl, copyText } from '../store'
-import { fmtCountdown, fmtTime } from '../format'
+import { fmtTime } from '../format'
 
 const props = defineProps({
   url: { type: String, required: true },
@@ -11,17 +12,6 @@ const props = defineProps({
   name: { type: String, default: '' },
 })
 
-const now = ref(Date.now())
-let timer = null
-onMounted(() => {
-  timer = setInterval(() => {
-    now.value = Date.now()
-  }, 1000)
-})
-onBeforeUnmount(() => clearInterval(timer))
-
-const remainMs = computed(() => new Date(props.expiresAt).getTime() - now.value)
-const expired = computed(() => remainMs.value <= 0)
 const fullUrl = computed(() => absoluteUrl(props.url))
 </script>
 
@@ -36,10 +26,10 @@ const fullUrl = computed(() => absoluteUrl(props.url))
     </div>
     <div class="linkcard__meta">
       <span v-if="name" class="linkcard__name">{{ name }}</span>
-      <span class="linkcard__count" :class="{ 'linkcard__count--expired': expired }">
+      <span class="linkcard__count">
         <Icon name="clock" :size="12" />
-        <template v-if="!expired">{{ fmtCountdown(remainMs) }} 后过期 ({{ fmtTime(expiresAt) }})</template>
-        <template v-else>已过期</template>
+        <Countdown :expires-at="expiresAt" />
+        <span class="linkcard__at">({{ fmtTime(expiresAt) }})</span>
       </span>
     </div>
     <p class="linkcard__warn">关闭页面前请保存链接 — 没有公开列表可以找回它。</p>
@@ -90,11 +80,10 @@ const fullUrl = computed(() => absoluteUrl(props.url))
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font: 12px var(--font-mono);
-  color: var(--red);
 }
 
-.linkcard__count--expired {
+.linkcard__at {
+  font: 12px var(--font-mono);
   color: var(--muted);
 }
 

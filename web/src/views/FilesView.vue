@@ -4,7 +4,7 @@ import { api, fsFileUrl } from '../api'
 import { xhrUpload } from '../upload'
 import { hashFile } from '../hash'
 import { toast, absoluteUrl, copyText } from '../store'
-import { fmtBytes, fmtTime, isImageName, isTextName, joinPath } from '../format'
+import { fmtBytes, fmtTime, isImageName, isTextName, isVideoName, joinPath } from '../format'
 import Icon from '../components/Icon.vue'
 import Modal from '../components/Modal.vue'
 import LinkCard from '../components/LinkCard.vue'
@@ -107,6 +107,7 @@ async function startUploads(files) {
           })
           task.phase = 'done'
           task.progress = 100
+          refresh() // 单个成功即刷新列表, 不等整批
           continue
         } catch (e) {
           // 404 = 库里没有或不可秒传, 走完整上传; 其余错误 (409 已存在/413 配额) 直接报
@@ -126,6 +127,7 @@ async function startUploads(files) {
       await up.promise
       task.phase = 'done'
       task.progress = 100
+      refresh() // 单个成功即刷新列表, 不等整批
     } catch (e) {
       task.phase = 'error'
       task.error = task.cancelled ? '已取消' : e.message
@@ -154,7 +156,7 @@ const downloadUrl = (e) => fsFileUrl('download', joinPath(currentPath.value, e.n
 const previewUrl = (e) => fsFileUrl('preview', joinPath(currentPath.value, e.name))
 
 function canPreview(e) {
-  return !e.is_dir && (isImageName(e.name) || isTextName(e.name))
+  return !e.is_dir && (isImageName(e.name) || isVideoName(e.name) || isTextName(e.name))
 }
 
 function onEntryClick(e) {
@@ -169,7 +171,7 @@ const preview = reactive({ open: false, entry: null, kind: '', text: '', loading
 async function openPreview(e) {
   preview.open = true
   preview.entry = e
-  preview.kind = isImageName(e.name) ? 'image' : 'text'
+  preview.kind = isImageName(e.name) ? 'image' : isVideoName(e.name) ? 'video' : 'text'
   preview.text = ''
   if (preview.kind === 'text') {
     preview.loading = true
@@ -324,6 +326,7 @@ async function doShareImages() {
     })
     shareImg.result = img
     toast(img.deduped ? '墙上已有这张图' : '已分享到图床')
+    refreshQuota() // 分享按引用加图床配额 (文档第 6 章)
   } catch (e) {
     toast(e.message, 'error')
   } finally {
@@ -340,7 +343,8 @@ async function doShareGuest(e) {
       path: joinPath(currentPath.value, e.name),
     })
     shareGuest.open = true
-    toast('已分享到访客空间')
+    toast(`已分享到访客空间, 链接: ${absoluteUrl(shareGuest.result.url)}`)
+    refreshQuota() // 分享按引用加访客配额
   } catch (err) {
     toast(err.message, 'error')
   }
@@ -430,7 +434,7 @@ async function doShareGuest(e) {
       <p v-if="error" class="files__empty">{{ error }}</p>
       <p v-else-if="!loading && !entries.length" class="files__empty">空目录 — 拖些文件进来吧</p>
       <div v-for="e in entries" :key="e.name" class="entry" @dblclick="onEntryClick(e)">
-        <button class="entry__name" @click="onEntryClick(e)">
+        <button class="entry__name" :title="e.name" @click="onEntryClick(e)">
           <Icon :name="e.is_dir ? 'folder' : 'file'" class="entry__icon" :class="{ 'entry__icon--dir': e.is_dir }" />
           <span>{{ e.name }}</span>
         </button>
@@ -546,6 +550,7 @@ async function doShareGuest(e) {
     <Modal v-if="preview.open" :title="preview.entry?.name || '预览'" wide @close="preview.open = false">
       <div class="previewbox">
         <img v-if="preview.kind === 'image'" :src="previewUrl(preview.entry)" :alt="preview.entry?.name" class="previewbox__img" />
+        <video v-else-if="preview.kind === 'video'" :src="previewUrl(preview.entry)" controls class="previewbox__video"></video>
         <pre v-else class="previewbox__text">{{ preview.loading ? '加载中…' : preview.text }}</pre>
       </div>
       <template #footer>
@@ -681,7 +686,7 @@ async function doShareGuest(e) {
 
 .files__head {
   display: grid;
-  grid-template-columns: 1fr 90px 130px auto;
+  grid-template-columns: minmax(0, 1fr) 90px 130px max-content;
   gap: 12px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--ink);
@@ -692,7 +697,7 @@ async function doShareGuest(e) {
 
 .entry {
   display: grid;
-  grid-template-columns: 1fr 90px 130px auto;
+  grid-template-columns: minmax(0, 1fr) 90px 130px max-content;
   gap: 12px;
   align-items: center;
   padding: 4px 16px;
@@ -712,13 +717,13 @@ async function doShareGuest(e) {
   display: flex;
   align-items: center;
   gap: 9px;
+  min-width: 0; /* grid 子项默认 min-width:auto, 不压的话长文件名会把后面的列顶出去 */
   padding: 6px 0;
   border: 0;
   background: none;
   text-align: left;
   font-size: 14px;
   cursor: pointer;
-  min-width: 0;
 }
 
 .entry__name span {
@@ -750,6 +755,7 @@ async function doShareGuest(e) {
   display: flex;
   gap: 2px;
   justify-self: end;
+  white-space: nowrap;
 }
 
 .files__empty {
@@ -854,6 +860,12 @@ async function doShareGuest(e) {
   max-height: 56vh;
   max-width: 100%;
   object-fit: contain;
+}
+
+.previewbox__video {
+  max-height: 56vh;
+  max-width: 100%;
+  background: #11100f;
 }
 
 .previewbox__text {

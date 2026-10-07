@@ -1,11 +1,12 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { xhrUpload } from '../upload'
-import { auth, toast, absoluteUrl, copyText } from '../store'
+import { auth, toast, absoluteUrl, copyText, initAuth } from '../store'
 import { fmtBytes, fmtTime } from '../format'
 import Icon from '../components/Icon.vue'
 import LinkCard from '../components/LinkCard.vue'
+import Countdown from '../components/Countdown.vue'
 import Modal from '../components/Modal.vue'
 
 const MAX_FILE = 50 * 1024 * 1024 // 50MB, 前端先挡; 后端 413 的 message 也会透出
@@ -58,6 +59,8 @@ async function start(files) {
       done.unshift(data)
       const i = uploads.findIndex((t) => t.id === task.id)
       if (i >= 0) uploads.splice(i, 1)
+      // 登录态下管理列表同步刷新 (别让用户切过去看到旧列表)
+      if (auth.user) loadList(1)
     } catch (e) {
       task.error = e.message // 429/413 等后端 message 原样透出
     }
@@ -100,7 +103,9 @@ async function doDelete(item) {
   try {
     await api.post('/api/guest/delete', { id: item.id })
     toast('已删除')
-    loadList(manage.page)
+    // 当前页删光了就回退一页, 免得停在空页上
+    if (manage.items.length === 1 && manage.page > 1) loadList(manage.page - 1)
+    else loadList(manage.page)
   } catch (e) {
     toast(e.message, 'error')
   }
@@ -117,9 +122,27 @@ async function doClear() {
   }
 }
 
-onMounted(() => {
-  if (auth.user) manage.open = false
+onMounted(async () => {
+  // 每次进 /guest 都重新拉 (别处分享到访客后, 回来必须看得到新文件);
+  // 等启动时的会话探测落定再决定拉不拉 (管理口要登录)
+  if (!auth.ready) await initAuth()
+  if (auth.user) loadList(1)
 })
+
+// 登录/登出联动: 登出清掉管理数据残影, 登录 (含换账号) 重新拉
+watch(
+  () => auth.user,
+  (u) => {
+    if (u) {
+      loadList(1)
+    } else {
+      manage.open = false
+      manage.items = []
+      manage.total = 0
+      manage.page = 1
+    }
+  },
+)
 </script>
 
 <template>
@@ -186,6 +209,7 @@ onMounted(() => {
           <span>文件</span>
           <span>大小</span>
           <span>来源 IP</span>
+          <span>剩余</span>
           <span>过期时间</span>
           <span>操作</span>
         </div>
@@ -194,6 +218,7 @@ onMounted(() => {
           <span class="guest__cell-name" :title="it.orig_name">{{ it.orig_name }}</span>
           <span class="mono muted">{{ fmtBytes(it.size) }}</span>
           <span class="mono muted">{{ it.source_ip }}</span>
+          <Countdown :expires-at="it.expires_at" />
           <span class="mono muted">{{ fmtTime(it.expires_at) }}</span>
           <span class="guest__cell-ops">
             <button class="btn btn--ghost btn--small" title="复制链接" @click="copyText(absoluteUrl(it.url))"><Icon name="copy" :size="13" /></button>
@@ -326,7 +351,7 @@ onMounted(() => {
 
 .guest__thead {
   display: grid;
-  grid-template-columns: 1fr 90px 110px 140px auto;
+  grid-template-columns: minmax(0, 1fr) 90px 110px 80px 140px max-content;
   gap: 12px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--ink);
@@ -337,7 +362,7 @@ onMounted(() => {
 
 .guest__row {
   display: grid;
-  grid-template-columns: 1fr 90px 110px 140px auto;
+  grid-template-columns: minmax(0, 1fr) 90px 110px 80px 140px max-content;
   gap: 12px;
   align-items: center;
   padding: 8px 16px;

@@ -35,10 +35,15 @@ export function extOf(name) {
 }
 
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif']
+const VIDEO_EXTS = ['mp4', 'webm']
 const TEXT_EXTS = ['txt', 'md', 'json', 'log', 'csv', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'js', 'css', 'html', 'svg', 'sh']
 
 export function isImageName(name) {
   return IMAGE_EXTS.includes(extOf(name))
+}
+
+export function isVideoName(name) {
+  return VIDEO_EXTS.includes(extOf(name))
 }
 
 export function isTextName(name) {

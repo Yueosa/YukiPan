@@ -99,6 +99,13 @@ function onImgLoad(id, e) {
   if (img.naturalWidth && img.naturalHeight) ratios[id] = img.naturalWidth / img.naturalHeight
 }
 
+// 缩略图加载失败 (或后端还没给 thumb_url) 时回退原图, 只回退一次防死循环
+function onImgFallback(e, url) {
+  if (e.target.dataset.fbk) return
+  e.target.dataset.fbk = '1'
+  e.target.src = url
+}
+
 function cellStyle(img) {
   const r = ratios[img.id] || 1.5
   return { flexGrow: Math.round(r * ROW_H), flexBasis: `${Math.round(r * ROW_H)}px` }
@@ -211,17 +218,25 @@ async function doDeleteAlbum(a) {
 
 function openTagEdit() {
   admin.tagEditValue = (current.value?.tags || []).join(', ')
+  // 灯箱 (z-70) 会盖住 modal (z-60): 先关灯箱再开弹窗, 完成后也不回灯箱
+  lightbox.open = false
   admin.tagEditOpen = true
+}
+
+function openRemoveConfirm() {
+  lightbox.open = false
+  admin.removeConfirm = true
 }
 
 async function doSetTags() {
   const list = admin.tagEditValue.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
   try {
     const tags = await api.post('/api/images/tags', { id: current.value.id, tags: list })
-    current.value.tags = tags
     toast('标签已更新')
     admin.tagEditOpen = false
     loadTags()
+    // 重拉图片流: 正按标签筛选时, 摘掉该标签的图应消失 / 打上该标签的图应出现
+    if (activeAlbum.value) resetWall()
   } catch (e) {
     toast(e.message, 'error')
   }
@@ -233,9 +248,10 @@ async function doRemoveImage() {
     toast('已从墙上拿掉 (私有文件不受影响)')
     admin.removeConfirm = false
     lightbox.open = false
-    images.value.splice(lightbox.index, 1)
-    total.value -= 1
     loadAlbums()
+    loadTags()
+    // 重拉图片流: 乐观 splice 会让 offset 分页错位 (后续「加载更多」漏一张)
+    if (activeAlbum.value) resetWall()
   } catch (e) {
     toast(e.message, 'error')
   }
@@ -305,7 +321,14 @@ async function doRemoveImage() {
       <p v-else-if="!loading && !images.length" class="photos__empty">这个相册还是空的</p>
       <div class="wall">
         <figure v-for="(img, i) in images" :key="img.id" class="wall__cell" :style="cellStyle(img)">
-          <img :src="img.url" :alt="img.orig_name" loading="lazy" @load="onImgLoad(img.id, $event)" @click="openLightbox(i)" />
+          <img
+            :src="img.thumb_url || img.url"
+            :alt="img.orig_name"
+            loading="lazy"
+            @load="onImgLoad(img.id, $event)"
+            @error="onImgFallback($event, img.url)"
+            @click="openLightbox(i)"
+          />
         </figure>
       </div>
       <div class="photos__more">
@@ -332,7 +355,7 @@ async function doRemoveImage() {
               <button class="btn btn--small" @click="copyText(absoluteUrl(current.url))"><Icon name="copy" :size="13" /> 复制链接</button>
               <template v-if="auth.user">
                 <button class="btn btn--small" @click="openTagEdit"><Icon name="tag" :size="13" /> 标签</button>
-                <button class="btn btn--small btn--danger" @click="admin.removeConfirm = true"><Icon name="trash" :size="13" /> 从墙上拿掉</button>
+                <button class="btn btn--small btn--danger" @click="openRemoveConfirm"><Icon name="trash" :size="13" /> 从墙上拿掉</button>
               </template>
             </span>
           </figcaption>
