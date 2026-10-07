@@ -24,12 +24,43 @@ pub struct Config {
     pub data_root: PathBuf,
     /// PostgreSQL 连接串, 必填。
     pub database_url: String,
-    /// Redis 连接串 (限流计数, 登录切片接入)。
+    /// Redis 连接串 (限流计数, 后续切片接入)。
     #[serde(default = "default_redis_url")]
     pub redis_url: String,
+    /// 会话有效期 (小时), 过期需重新登录。
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
     /// 配额与单文件上限。
     #[serde(default)]
     pub quota: Quota,
+    /// 访客空间的 TTL 与按 IP 限流。
+    #[serde(default)]
+    pub guest: Guest,
+}
+
+/// 访客空间防滥用: TTL 自动过期 + 按 IP 限流 (文档第 4、5 章)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Guest {
+    /// 访客文件过期时间 (小时), 到期删指向。
+    pub ttl_hours: u64,
+    /// 每 IP 每小时上传次数上限。
+    pub upload_per_hour: u64,
+    /// 每 IP 每小时上传字节上限。
+    pub upload_bytes_per_hour: u64,
+    /// 每 IP 每天上传字节上限。
+    pub upload_bytes_per_day: u64,
+}
+
+impl Default for Guest {
+    fn default() -> Self {
+        Self {
+            ttl_hours: 24,
+            upload_per_hour: 10,
+            upload_bytes_per_hour: 200 * MIB,
+            upload_bytes_per_day: 500 * MIB,
+        }
+    }
 }
 
 /// 配额, 缺省值即文档第 6 章的预算。单位一律字节。
@@ -42,7 +73,7 @@ pub struct Quota {
     pub images_limit: u64,
     /// 访客空间引用配额。
     pub guest_limit: u64,
-    /// 盘上余量红线: 可用空间低于此值即拒收 (tmp/库/系统不占账本)。
+    /// 盘上余量红线: 可用空间低于此值即拒收 (tmp/库/系统不计入配额)。
     pub reserve: u64,
     /// 访客单文件上限。
     pub guest_max_file: u64,
@@ -116,11 +147,15 @@ fn default_listen() -> SocketAddr {
 }
 
 fn default_data_root() -> PathBuf {
-    PathBuf::from("~/.YukiPan")
+    PathBuf::from("/var/lib/yukipan")
 }
 
 fn default_redis_url() -> String {
     "redis://127.0.0.1:6379".into()
+}
+
+fn default_session_ttl_hours() -> u64 {
+    168
 }
 
 #[cfg(test)]
@@ -132,9 +167,11 @@ mod tests {
     fn defaults_fill_when_only_required_given() {
         let c = Config::parse(r#"database_url = "postgres://x""#).unwrap();
         assert_eq!(c.listen, SocketAddr::from(([127, 0, 0, 1], 8516)));
-        assert_eq!(c.data_root, PathBuf::from("~/.YukiPan"));
+        assert_eq!(c.data_root, PathBuf::from("/var/lib/yukipan"));
         assert_eq!(c.redis_url, "redis://127.0.0.1:6379");
+        assert_eq!(c.session_ttl_hours, 168);
         assert_eq!(c.quota, Quota::default());
+        assert_eq!(c.guest, Guest::default());
     }
 
     #[test]
@@ -163,6 +200,15 @@ mod tests {
         assert_eq!(q.reserve, 2 * GIB);
         assert_eq!(q.guest_max_file, 50 * MIB);
         assert_eq!(q.images_max_file, 20 * MIB);
+    }
+
+    #[test]
+    fn guest_defaults_match_doc() {
+        let g = Guest::default();
+        assert_eq!(g.ttl_hours, 24);
+        assert_eq!(g.upload_per_hour, 10);
+        assert_eq!(g.upload_bytes_per_hour, 200 * MIB);
+        assert_eq!(g.upload_bytes_per_day, 500 * MIB);
     }
 
     #[test]

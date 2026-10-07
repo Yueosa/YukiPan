@@ -15,9 +15,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+yukipan-config = { workspace = true }
 yukipan-fs = { workspace = true }
 yukipan-limit = { workspace = true }
 yukipan-store = { workspace = true }
 
 [dev-dependencies]
+sqlx = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

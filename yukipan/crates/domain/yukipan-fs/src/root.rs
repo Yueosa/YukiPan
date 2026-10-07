@@ -33,7 +33,7 @@ pub enum ResolveError {
 }
 
 impl DataRoot {
-    /// 以 `root` 为数据根。目录必须已存在 (由 install.sh 建立)。
+    /// 以 `root` 为数据根。目录必须已存在 (由 ops/bootstrap-host.sh 建立)。
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ResolveError> {
         let root = match root.as_ref().canonicalize() {
             Ok(abs) => abs,

@@ -1,15 +1,18 @@
 # YukiPan 后端配置示例 (文档第 8 章)。
 #
-# 生产: install.sh 交互式收集机器常量后生成 ~/.YukiPan/config.toml, 不用手工复制。
+# 生产: ops/bootstrap-host.sh 基于本文件实例化生成 /etc/yukipan/config.toml, 不用手工复制。
 # 开发: cp config.example.toml config.dev.toml (已 gitignore), 改 database_url 密码。
 #
-# 环境变量: 后端只认 YUKIPAN_CONFIG —— 配置文件路径, 缺省 ~/.YukiPan/config.toml。
+# 环境变量: 后端只认 YUKIPAN_CONFIG —— 配置文件路径, 缺省 /etc/yukipan/config.toml。
 # 单个字段没有 env 覆盖通道, 改配置就改文件。
 
 listen = "127.0.0.1:8516"
-data_root = "~/.YukiPan"
+data_root = "/var/lib/yukipan"
 database_url = "postgres://yukipan:CHANGE_ME@127.0.0.1:5432/yukipan"
 redis_url = "redis://127.0.0.1:6379"
+
+# 会话有效期 (小时), 过期需重新登录
+session_ttl_hours = 168
 
 # 配额与单文件上限, 单位字节; 缺省即文档第 6 章预算, 下表仅为示意。
 # *_limit 是「引用配额」(同一内容挂多处按多处计); reserve 是真实磁盘余量红线。
@@ -26,3 +29,14 @@ reserve = 2147483648          # 2 GiB
 # 单文件大小限制: 按入口卡, 不按文件内容分类
 guest_max_file = 52428800     # 50 MiB; 只卡 /api/guest/upload
 images_max_file = 20971520    # 20 MiB; 只卡 /api/images/upload (另有扩展名白名单)
+
+# 访客空间防滥用: TTL + 按 IP 的上传限流 (Redis 短窗口计数, 超限 429)
+[guest]
+# 访客文件过期时间 (小时), 到期删指向, 引用计数归 0 才删 blob
+ttl_hours = 24
+# 每 IP 每小时上传次数上限
+upload_per_hour = 10
+# 每 IP 每小时上传字节上限
+upload_bytes_per_hour = 209715200   # 200 MiB
+# 每 IP 每天上传字节上限
+upload_bytes_per_day = 524288000    # 500 MiB

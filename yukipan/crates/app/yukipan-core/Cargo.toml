@@ -8,6 +8,7 @@ description = "YukiPan 装配层：配置、库连接、域名服务、HTTP 监�
 
 [dependencies]
 axum = { workspace = true }
+rpassword = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 yukipan-api = { workspace = true }

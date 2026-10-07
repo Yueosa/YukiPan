@@ -1,10 +1,23 @@
-//! YukiPan 服务端二进制: 入口、运行时与退出码。
+//! YukiPan 服务端二进制: 入口、子命令分发与退出码。
 
 use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match yukipan_core::run().await {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = match args.as_slice() {
+        // 默认即 serve; 服务生命周期归 systemd (systemctl), 不做 start/stop 子命令。
+        [] | ["serve"] => yukipan_core::run().await,
+        ["user", "add", username] => yukipan_core::user_add(username).await,
+        _ => {
+            eprintln!("用法:");
+            eprintln!("  yukipan [serve]             运行 HTTP 服务 (默认, 由 systemd 拉起)");
+            eprintln!("  yukipan user add <用户名>   交互式建用户");
+            return ExitCode::from(2);
+        }
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("yukipan: {e}");
