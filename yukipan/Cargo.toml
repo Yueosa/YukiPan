@@ -16,6 +16,14 @@ chrono = { version = "0.4", default-features = false, features = [
     "std",
     "serde",
 ] }
+# 锁定 0.24: 0.25 移除了 lossy WebP 编码 (image-rs/image#1984), 缩略图必须 q80 lossy
+image = { version = "=0.24.9", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "webp-encoder",
+] }
 password-hash = { version = "0.5", features = ["rand_core", "std"] }
 libc = "0.2"
 redis = { version = "1", default-features = false, features = [

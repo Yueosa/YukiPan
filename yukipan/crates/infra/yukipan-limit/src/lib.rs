@@ -113,6 +113,26 @@ impl Limiter {
         }
     }
 
+    /// key 的剩余生存期 (PTTL); key 不存在/没有 TTL/降级/失败一律 None。
+    /// 429 响应的 Retry-After 取自这里。
+    pub async fn ttl(&self, key: &str) -> Option<Duration> {
+        let Some(conn) = &self.conn else { return None };
+        let mut conn = conn.clone();
+        match redis::cmd("PTTL")
+            .arg(key)
+            .query_async::<i64>(&mut conn)
+            .await
+        {
+            // -2 = key 不存在, -1 = 没有 TTL (不该出现, 出现当没窗口处理)
+            Ok(ms) if ms > 0 => Some(Duration::from_millis(ms as u64)),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Redis 读 TTL 失败 ({e})");
+                None
+            }
+        }
+    }
+
     /// 清零 (登录成功后清掉该 IP 的失败计数)。
     pub async fn clear(&self, key: &str) {
         let Some(conn) = &self.conn else { return };
@@ -153,7 +173,11 @@ mod tests {
         assert_eq!(l.incr(&key, D::from_secs(60)).await, 2);
         assert_eq!(l.incr_by(&key, 8, D::from_secs(60)).await, 10);
         assert_eq!(l.get(&key).await, 10);
+        // ttl: 窗口在走, 剩余时间应在 (0, 60s] 之间
+        let ttl = l.ttl(&key).await.expect("key 有 TTL");
+        assert!(ttl.as_secs() <= 60 && ttl.as_millis() > 0);
         l.clear(&key).await;
         assert_eq!(l.get(&key).await, 0);
+        assert_eq!(l.ttl(&key).await, None);
     }
 }

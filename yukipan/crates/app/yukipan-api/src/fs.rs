@@ -468,7 +468,7 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// 预览 Content-Type 安全映射 (文档第 5 章): 只有图片与 pdf 给真类型。
+/// 预览 Content-Type 安全映射 (文档第 5 章): 只有图片、视频与 pdf 给真类型。
 fn preview_content_type(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
@@ -477,6 +477,9 @@ fn preview_content_type(name: &str) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "avif" => "image/avif",
+        // 前端 <video> 页内播放; 浏览器对这两类容器 sniff 也安全
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         "pdf" => "application/pdf",
         _ => "text/plain; charset=utf-8",
     }
@@ -555,6 +558,8 @@ mod tests {
         assert_eq!(preview_content_type("a.png"), "image/png");
         assert_eq!(preview_content_type("a.avif"), "image/avif");
         assert_eq!(preview_content_type("a.pdf"), "application/pdf");
+        assert_eq!(preview_content_type("a.mp4"), "video/mp4");
+        assert_eq!(preview_content_type("a.WEBM"), "video/webm");
         // html/svg/js 一律纯文本 (文档第 5 章)
         for n in ["a.html", "a.svg", "a.js", "a.txt", "noext"] {
             assert_eq!(preview_content_type(n), "text/plain; charset=utf-8", "{n}");

@@ -14,7 +14,7 @@ use yukipan_store::User;
 
 use crate::AppState;
 use crate::error::ApiError;
-use crate::util::{MaybeConnectInfo, client_ip};
+use crate::util::{MaybeConnectInfo, client_ip, too_many};
 use crate::wire::Envelope;
 
 /// 会话 cookie 名。
@@ -60,7 +60,7 @@ pub async fn login(
     let fail_key = format!("login:fail:{ip}");
     // 「动作后记录, 超阈值拒绝下次尝试」: 先查后验。阈值/窗口走 config [auth]。
     if state.limiter.get(&fail_key).await >= state.config.auth.login_fail_max {
-        return Err(ApiError::too_many("失败次数过多, 请稍后再试"));
+        return Err(too_many(&state.limiter, &fail_key, "失败次数过多").await);
     }
     let user = state
         .store

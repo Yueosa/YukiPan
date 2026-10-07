@@ -333,6 +333,15 @@ impl Store {
         Ok(self.get_image(id).await?.expect("刚插入的图必然存在"))
     }
 
+    /// 全量图片指向的 (public_name, sha256) — `yukipan thumbs rebuild` 用。
+    pub async fn list_all_image_refs(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT public_name, sha256 FROM image_refs ORDER BY created_at")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
     /// 按 id 取图 (不限归属, 内部用)。
     pub async fn get_image(&self, image_id: Uuid) -> Result<Option<ImageRef>> {
         let row =

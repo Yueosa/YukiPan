@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 use crate::error::ApiError;
+use yukipan_limit::Limiter;
 use tracing::error;
 
 /// ConnectInfo 的可选版: axum 0.8 的 ConnectInfo 没有 OptionalFromRequestParts,
@@ -103,4 +104,47 @@ pub fn multipart_err(e: axum::extract::multipart::MultipartError) -> ApiError {
 pub fn internal_io(e: std::io::Error) -> ApiError {
     error!("io error: {e}");
     ApiError::Internal("内部错误".into())
+}
+
+/// 429 组装: 从限流桶 TTL 算剩余时间, message 带上, 响应头带 Retry-After。
+/// 桶 TTL 拿不到 (降级/桶刚过期) 退回无剩余时间的干消息、不带 Retry-After。
+pub async fn too_many(limiter: &Limiter, key: &str, base: &str) -> ApiError {
+    match limiter.ttl(key).await {
+        Some(d) => {
+            let secs = d.as_secs().max(1);
+            ApiError::too_many_after(
+                format!("{base}, 请 {}后重试", human_remaining(secs)),
+                secs,
+            )
+        }
+        None => ApiError::too_many(format!("{base}, 请稍后再试")),
+    }
+}
+
+/// 剩余时间人性化: ≥1 小时按小时, ≥1 分钟按分钟, 其余按秒; 全部向上取整。
+fn human_remaining(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{} 小时", secs.div_ceil(3600))
+    } else if secs >= 60 {
+        format!("{} 分钟", secs.div_ceil(60))
+    } else {
+        format!("{secs} 秒")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_remaining_units() {
+        assert_eq!(human_remaining(1), "1 秒");
+        assert_eq!(human_remaining(59), "59 秒");
+        assert_eq!(human_remaining(60), "1 分钟");
+        assert_eq!(human_remaining(61), "2 分钟");
+        assert_eq!(human_remaining(3599), "60 分钟");
+        assert_eq!(human_remaining(3600), "1 小时");
+        assert_eq!(human_remaining(3700), "2 小时");
+        assert_eq!(human_remaining(90000), "25 小时");
+    }
 }

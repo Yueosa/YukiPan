@@ -84,9 +84,37 @@ fn spawn_guest_sweeper(state: AppState) {
 /// 数据根子目录布局兜底 (文档第 6 章)。生产由 ops/bootstrap-host.sh 建,
 /// 这里 create_dir_all 幂等补建, 让开发/手搓环境启动不踩缺目录的坑。
 fn ensure_data_root_layout(data_root: &Path) -> Result<(), CoreError> {
-    for sub in ["blobs", "private", "public/images", "public/guest", "tmp"] {
+    for sub in ["blobs", "private", "public/images", "public/guest", "public/thumbs", "tmp"] {
         std::fs::create_dir_all(data_root.join(sub))?;
     }
+    Ok(())
+}
+
+/// `yukipan thumbs rebuild`: 遍历图床指向, 缺缩略图的补生成 (存量图搬迁/上线前跑一次)。
+pub async fn thumbs_rebuild() -> Result<(), CoreError> {
+    let config = Config::load(config_path())?;
+    let pool = yukipan_db::connect(&config.database_url).await?;
+    let store = Store::new(pool.clone());
+    let blobs = BlobStore::new(pool, &config.data_root);
+    let refs = store.list_all_image_refs().await?;
+    let total = refs.len();
+    let (mut generated, mut skipped, mut failed) = (0u64, 0u64, 0u64);
+    for (i, (public_name, sha256)) in refs.into_iter().enumerate() {
+        if blobs.thumb_url(&public_name).is_some() {
+            skipped += 1;
+            continue;
+        }
+        let ok = blobs
+            .generate_thumb(&blobs.blob_file_path(&sha256), &public_name)
+            .await;
+        if ok {
+            generated += 1;
+        } else {
+            failed += 1;
+        }
+        println!("[{}/{total}] {public_name}: {}", i + 1, if ok { "已生成" } else { "失败 (跳过)" });
+    }
+    println!("缩略图重建完成: 共 {total}, 新生成 {generated}, 已存在跳过 {skipped}, 失败 {failed}");
     Ok(())
 }
 

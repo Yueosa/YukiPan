@@ -19,7 +19,7 @@ use crate::AppState;
 use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::images::Page;
-use crate::util::{MaybeConnectInfo, client_ip, content_length, internal_io, stream_to_tmp};
+use crate::util::{MaybeConnectInfo, client_ip, content_length, internal_io, stream_to_tmp, too_many};
 use crate::wire::Envelope;
 use tracing::{error, warn};
 
@@ -100,18 +100,17 @@ pub async fn upload(
     let max_file = state.config.quota.guest_max_file;
 
     // 第一道: 次数/小时。每次尝试都计数 (被拒的也算, 防试探)。
-    let n = state
-        .limiter
-        .incr(&format!("guest:cnt:{ip}"), HOUR)
-        .await;
+    let cnt_key = format!("guest:cnt:{ip}");
+    let n = state.limiter.incr(&cnt_key, HOUR).await;
     if n > guest_cfg.upload_per_hour {
-        return Err(ApiError::too_many("上传太频繁, 请稍后再试"));
+        return Err(too_many(&state.limiter, &cnt_key, "上传太频繁").await);
     }
     // 第二道前置粗检: 声明长度 + 已用量超字节桶就直接拒, 不收 body。
     if let Some(len) = content_length(&headers) {
-        let used = state.limiter.get(&format!("guest:bytes:hour:{ip}")).await;
+        let hour_key = format!("guest:bytes:hour:{ip}");
+        let used = state.limiter.get(&hour_key).await;
         if used.saturating_add(len) > guest_cfg.upload_bytes_per_hour {
-            return Err(ApiError::too_many("本小时上传流量已超上限"));
+            return Err(too_many(&state.limiter, &hour_key, "本小时上传流量已超上限").await);
         }
         if len > max_file {
             return Err(ApiError::too_large("单文件超过大小上限"));
@@ -141,21 +140,17 @@ pub async fn upload(
 
     // 第二、三道按真实大小记字节桶 (被拒的流量也入账, 保守口径)。
     let size = std::fs::metadata(&tmp).map_err(internal_io)?.len();
-    let hour_bytes = state
-        .limiter
-        .incr_by(&format!("guest:bytes:hour:{ip}"), size, HOUR)
-        .await;
+    let hour_key = format!("guest:bytes:hour:{ip}");
+    let hour_bytes = state.limiter.incr_by(&hour_key, size, HOUR).await;
     if hour_bytes > guest_cfg.upload_bytes_per_hour {
         let _ = std::fs::remove_file(&tmp);
-        return Err(ApiError::too_many("本小时上传流量已超上限"));
+        return Err(too_many(&state.limiter, &hour_key, "本小时上传流量已超上限").await);
     }
-    let day_bytes = state
-        .limiter
-        .incr_by(&format!("guest:bytes:day:{ip}"), size, DAY)
-        .await;
+    let day_key = format!("guest:bytes:day:{ip}");
+    let day_bytes = state.limiter.incr_by(&day_key, size, DAY).await;
     if day_bytes > guest_cfg.upload_bytes_per_day {
         let _ = std::fs::remove_file(&tmp);
-        return Err(ApiError::too_many("今日上传流量已超上限"));
+        return Err(too_many(&state.limiter, &day_key, "今日上传流量已超上限").await);
     }
 
     // 匿名上传记 owner 的 guest 账 (单用户应用即管理员; 见 store::guest 模块文档)。
@@ -669,8 +664,16 @@ mod db_tests {
         assert_eq!(st, StatusCode::OK);
         let (st, _) = guest_upload(&f.app, &ip, "b.txt", &c).await;
         assert_eq!(st, StatusCode::OK);
-        let (st, v) = guest_upload(&f.app, &ip, "c.txt", &c).await;
-        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        // 第三次触发 429: 带 Retry-After 头与剩余时间消息
+        let (ct, body) = multipart("c.txt", &c);
+        let resp = call(&f.app, "POST", "/api/guest/upload", None, Some(&ip), Some(&ct), Body::from(body)).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = resp.headers().get("retry-after").unwrap().to_str().unwrap();
+        let retry_secs: u64 = retry.parse().unwrap();
+        assert!(retry_secs > 0 && retry_secs <= 3600, "Retry-After {retry}");
+        let v = json_body(resp).await;
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("上传太频繁") && (msg.contains("分钟") || msg.contains("秒")), "{msg}");
         // 别的 IP 不受影响
         let other_ip = format!("11.0.1.{}", tag.as_u128() % 200 + 1);
         let (st, _) = guest_upload(&f.app, &other_ip, "d.txt", &c).await;
@@ -684,8 +687,12 @@ mod db_tests {
         let big = tag.to_string().repeat(60).into_bytes();
         let (st, _) = guest_upload(&f2.app, &ip2, "x.zip", &big[..2000]).await;
         assert_eq!(st, StatusCode::OK);
-        let (st, _) = guest_upload(&f2.app, &ip2, "y.zip", &big[..2000]).await;
-        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        let (ct, body) = multipart("y.zip", &big[..2000]);
+        let resp = call(&f2.app, "POST", "/api/guest/upload", None, Some(&ip2), Some(&ct), Body::from(body)).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_some());
+        let v = json_body(resp).await;
+        assert!(v["message"].as_str().unwrap().contains("本小时上传流量已超上限"));
         // 天桶也在记; 被时桶拒掉的那次不再消耗天桶 (先过时桶才入天账)
         let day = f2.state.limiter.get(&format!("guest:bytes:day:{ip2}")).await;
         assert_eq!(day, 2000, "天桶 {day}");
@@ -727,7 +734,21 @@ mod db_tests {
             assert_eq!(try_login(&f.app, &name, "wrong", &ip).await, StatusCode::UNAUTHORIZED, "第 {i} 次");
         }
         assert_eq!(try_login(&f.app, &name, "wrong", &ip).await, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(try_login(&f.app, &name, "pw", &ip).await, StatusCode::TOO_MANY_REQUESTS);
+        // 429 带 Retry-After 与剩余时间 (窗口 10 分钟)
+        let resp = f.app.clone().oneshot(
+            Request::post("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-real-ip", &ip)
+                .body(Body::from(format!(r#"{{"username":"{name}","password":"pw"}}"#)))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = resp.headers().get("retry-after").unwrap().to_str().unwrap();
+        let retry_secs: u64 = retry.parse().unwrap();
+        assert!(retry_secs > 0 && retry_secs <= 600, "Retry-After {retry}");
+        let v = json_body(resp).await;
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("失败次数过多") && msg.contains("分钟后重试"), "{msg}");
         // 清理, 别影响其他用例 (不同 IP 桶, 但保持整洁)
         f.state.limiter.clear(&format!("login:fail:{ip}")).await;
     }

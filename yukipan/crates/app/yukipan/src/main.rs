@@ -10,10 +10,12 @@ async fn main() -> ExitCode {
         // 默认即 serve; 服务生命周期归 systemd (systemctl), 不做 start/stop 子命令。
         [] | ["serve"] => yukipan_core::run().await,
         ["user", "add", username] => yukipan_core::user_add(username).await,
+        ["thumbs", "rebuild"] => yukipan_core::thumbs_rebuild().await,
         _ => {
             eprintln!("用法:");
             eprintln!("  yukipan [serve]             运行 HTTP 服务 (默认, 由 systemd 拉起)");
             eprintln!("  yukipan user add <用户名>   交互式建用户");
+            eprintln!("  yukipan thumbs rebuild      为存量图床图片补生成缩略图");
             return ExitCode::from(2);
         }
     };

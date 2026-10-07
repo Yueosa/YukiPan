@@ -23,6 +23,7 @@ yukipan-limit = { workspace = true }
 yukipan-store = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

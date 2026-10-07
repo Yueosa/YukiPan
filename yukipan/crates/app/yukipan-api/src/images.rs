@@ -46,6 +46,8 @@ pub struct TagView {
 pub struct ImageView {
     pub id: Uuid,
     pub url: String,
+    /// 缩略图 url (长边 640 webp); 没生成 (坏图/avif/存量) 为 null, 前端回退 url。
+    pub thumb_url: Option<String>,
     pub orig_name: String,
     pub sha256: String,
     pub size: u64,
@@ -112,10 +114,12 @@ pub struct ShareReq {
     album_id: Option<Uuid>,
 }
 
-fn image_view(i: ImageRef) -> ImageView {
+fn image_view(state: &AppState, i: ImageRef) -> ImageView {
+    let thumb_url = state.blobs.thumb_url(&i.public_name);
     ImageView {
         id: i.id,
         url: format!("{PUBLIC_URL_PREFIX}{}", i.public_name),
+        thumb_url,
         orig_name: i.orig_name,
         sha256: i.sha256,
         size: i.size,
@@ -160,7 +164,7 @@ pub async fn list_images(
         .list_images(q.album_id, tag, page, per_page)
         .await?;
     Ok(Json(Envelope::ok(Page {
-        items: items.into_iter().map(image_view).collect(),
+        items: items.into_iter().map(|i| image_view(&state, i)).collect(),
         total,
         page,
         per_page,
@@ -293,7 +297,7 @@ pub async fn instant(
         .await?
     {
         return Ok(Json(Envelope::ok(ImageUploadResp {
-            image: image_view(existing),
+            image: image_view(&state, existing),
             deduped: true,
         })));
     }
@@ -310,7 +314,7 @@ pub async fn instant(
     let image = hang_image(&state, uid, album, &req.name, &ext, &req.sha256, actual).await?;
     let image = apply_tags(&state, uid, image, req.tags).await?;
     Ok(Json(Envelope::ok(ImageUploadResp {
-        image: image_view(image),
+        image: image_view(&state, image),
         deduped: false,
     })))
 }
@@ -331,6 +335,7 @@ pub async fn delete_image(
     {
         warn!("删除公开图文件失败 ({}): {e}", image.public_name);
     }
+    state.blobs.remove_thumb(&image.public_name);
     if let Err(e) = state
         .store
         .usage_sub(uid, Space::Images, image.size)
@@ -380,13 +385,13 @@ pub async fn share(
     let album = resolve_album(&state, uid, req.album_id).await?;
     if let Some(existing) = state.store.find_image_in_album(uid, album, &sha256).await? {
         return Ok(Json(Envelope::ok(ImageUploadResp {
-            image: image_view(existing),
+            image: image_view(&state, existing),
             deduped: true,
         })));
     }
     let image = hang_image(&state, uid, album, name, &ext, &sha256, size).await?;
     Ok(Json(Envelope::ok(ImageUploadResp {
-        image: image_view(image),
+        image: image_view(&state, image),
         deduped: false,
     })))
 }
@@ -410,7 +415,7 @@ async fn finish_image_upload(
     // 同 hash 已在墙 (任一相册): 直接回旧图, 不新建不加配额 (文档第 6 章)。
     if let Some(existing) = state.store.find_image_by_hash(uid, &outcome.sha256).await? {
         return Ok(ImageUploadResp {
-            image: image_view(existing),
+            image: image_view(&state, existing),
             deduped: true,
         });
     }
@@ -419,7 +424,7 @@ async fn finish_image_upload(
     let image = hang_image(state, uid, album, orig_name, ext, &outcome.sha256, outcome.size).await?;
     let image = apply_tags(state, uid, image, tags).await?;
     Ok(ImageUploadResp {
-        image: image_view(image),
+        image: image_view(&state, image),
         deduped: false,
     })
 }
@@ -448,7 +453,14 @@ async fn hang_image(
         return Err(internal_io(e));
     }
     match state.store.insert_image(album_id, &public_name, orig_name, sha256).await {
-        Ok(image) => Ok(image),
+        Ok(image) => {
+            // 缩略图尽力而为: 失败 (avif/坏图) 不挡挂图, thumb_url 置空前端回退原图。
+            state
+                .blobs
+                .generate_thumb(&state.blobs.blob_file_path(sha256), &public_name)
+                .await;
+            Ok(image)
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&target);
             rollback_usage(state, uid, size).await;
@@ -719,6 +731,16 @@ mod db_tests {
         (format!("multipart/form-data; boundary={boundary}"), body)
     }
 
+    /// 造一张真实 png (缩略图断言用; 文本内容喂给解码器会失败, 走 thumb 缺失回退)。
+    fn make_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 96])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
     async fn upload_image(
         app: &Router,
         cookie: &str,
@@ -757,6 +779,8 @@ mod db_tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["data"]["deduped"], false);
         assert_eq!(v["data"]["album_name"], "默认相册");
+        // 文本内容不是真图: 缩略图解码失败, thumb_url 置空 (前端回退原图)
+        assert_eq!(v["data"]["thumb_url"], Value::Null);
         assert!(v["data"]["url"].as_str().unwrap().starts_with("/public/images/"));
         assert!(v["data"]["url"].as_str().unwrap().ends_with(".jpg"));
         let sha1 = v["data"]["sha256"].as_str().unwrap().to_string();
@@ -918,6 +942,31 @@ mod db_tests {
         let (st, _) = post_json(&f.app, "/api/fs/delete", Some(&c1), json!({"path": "photo.png", "recursive": false})).await;
         assert_eq!(st, StatusCode::OK);
         assert!(!f.state.blobs.blob_file_path(&sha2).exists());
+
+        // 缩略图: 真 png 上传 → 生成 640 长边 webp, list 带 thumb_url, 删除连带清
+        let png = make_png(1000, 500);
+        let (st, v) = upload_image(&f.app, &c1, "real.png", &png, &[]).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let thumb_url = v["data"]["thumb_url"].as_str().unwrap().to_string();
+        assert!(thumb_url.starts_with("/public/thumbs/") && thumb_url.ends_with(".webp"));
+        let real_id = v["data"]["id"].as_str().unwrap().to_string();
+        let real_public = v["data"]["url"].as_str().unwrap().trim_start_matches("/public/images/").to_string();
+        let thumb_path = f.state.blobs.data_root().join("public/thumbs")
+            .join(thumb_url.trim_start_matches("/public/thumbs/"));
+        assert!(thumb_path.exists());
+        // 长边缩到 640
+        let decoded = image::open(&thumb_path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (640, 320));
+        // list 里同一张图带 thumb_url
+        let resp = call(&f.app, "GET", "/api/images/list", None, None, Body::empty()).await;
+        let v = json_body(resp).await;
+        let item = v["data"]["items"].as_array().unwrap().iter().find(|i| i["id"] == real_id).unwrap();
+        assert_eq!(item["thumb_url"].as_str().unwrap(), thumb_url);
+        // 删除指向 → 缩略图连带消失
+        let (st, _) = post_json(&f.app, "/api/images/delete", Some(&c1), json!({"id": real_id})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(!thumb_path.exists());
+        let _ = real_public;
     }
 
     #[tokio::test]

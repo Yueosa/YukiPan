@@ -148,3 +148,4 @@ mod db_tests {
         assert_eq!(v["data"]["disk"]["reserve"], config.quota.reserve);
     }
 }
+

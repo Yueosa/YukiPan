@@ -24,8 +24,11 @@ pub enum ApiError {
     Conflict(String),
     /// 配额/大小超限。
     PayloadTooLarge(String),
-    /// 限流 (短时计数超阈值, 文档第 5 章)。
-    TooManyRequests(String),
+    /// 限流 (短时计数超阈值, 文档第 5 章)。retry_after 秒数渲成 Retry-After 头。
+    TooManyRequests {
+        message: String,
+        retry_after: Option<u64>,
+    },
     /// 内部错误, 细节只进服务端日志, 不回给前端。
     Internal(String),
 }
@@ -52,7 +55,17 @@ impl ApiError {
     }
 
     pub fn too_many(message: impl Into<String>) -> Self {
-        Self::TooManyRequests(message.into())
+        Self::TooManyRequests {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    pub fn too_many_after(message: impl Into<String>, retry_after: u64) -> Self {
+        Self::TooManyRequests {
+            message: message.into(),
+            retry_after: Some(retry_after),
+        }
     }
 }
 
@@ -104,6 +117,21 @@ impl From<ResolveError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Self::TooManyRequests {
+            message,
+            retry_after,
+        } = self
+        {
+            let mut resp =
+                (StatusCode::TOO_MANY_REQUESTS, Json(Envelope::err(message))).into_response();
+            if let Some(secs) = retry_after {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    secs.to_string().parse().expect("秒数必为合法头值"),
+                );
+            }
+            return resp;
+        }
         let (status, message) = match self {
             Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
@@ -111,7 +139,7 @@ impl IntoResponse for ApiError {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
-            Self::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m),
+            Self::TooManyRequests { .. } => unreachable!("429 已在上面处理"),
             Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, Json(Envelope::err(message))).into_response()

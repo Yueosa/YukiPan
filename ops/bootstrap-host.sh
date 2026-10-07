@@ -128,7 +128,8 @@ install -d -m 755 /var/www/yukipan/releases /var/www/yukipan/incoming
 install -d -o yukipan -g yukipan -m 750 \
     /var/lib/yukipan /var/lib/yukipan/blobs /var/lib/yukipan/private \
     /var/lib/yukipan/public /var/lib/yukipan/public/images \
-    /var/lib/yukipan/public/guest /var/lib/yukipan/tmp
+    /var/lib/yukipan/public/guest /var/lib/yukipan/public/thumbs \
+    /var/lib/yukipan/tmp
 # nginx 以 www-data 运行，借 yukipan 组直出 /public 与 /protected
 usermod -aG yukipan www-data
 install -d -m 700 /var/backups/yukipan
