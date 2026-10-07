@@ -9,6 +9,7 @@ description = "YukiPan 核心域：blob 落盘、指向与去重、配额、会�
 [dependencies]
 argon2 = { workspace = true }
 chrono = { workspace = true }
+libc = { workspace = true }
 password-hash = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }

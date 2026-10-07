@@ -27,6 +27,15 @@ pub enum ResolveError {
     /// 经符号链接解析后逃出了数据根。
     #[error("路径逃出数据根")]
     Escape,
+    /// 删除目录但未指定递归, 目录非空。
+    #[error("目录非空")]
+    NotEmpty,
+    /// 移动/删除的对象是数据根本身。
+    #[error("根目录不允许该操作")]
+    RootForbidden,
+    /// 移动/创建的目标位置已有条目, 不静默覆盖。
+    #[error("目标已存在")]
+    AlreadyExists,
     /// 底层 IO 错误 (权限、竞争删除等)。
     #[error(transparent)]
     Io(#[from] std::io::Error),

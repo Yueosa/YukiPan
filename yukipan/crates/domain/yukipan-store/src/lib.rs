@@ -1,6 +1,14 @@
 //! YukiPan 核心域: blob 落盘、指向与去重、配额、会话与登录。
 //!
-//! 当前实现: 用户 (argon2id 哈希) 与数据库会话。
+//! 当前实现: 用户 (argon2id 哈希) 与数据库会话 ([`Store`]);
+//! blob 内容寻址存储与私有区指向 ([`BlobStore`]); 引用配额账本与磁盘余量闸
+//! ([`Space`], 方法在 [`Store`] / [`BlobStore`] 上)。
+
+mod blob;
+mod quota;
+
+pub use blob::{BlobStore, IngestOutcome};
+pub use quota::Space;
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use chrono::{DateTime, Duration, Utc};
@@ -13,7 +21,7 @@ use uuid::Uuid;
 /// 面向 HTTP/CLI 层的存储入口, 包着连接池。
 #[derive(Debug, Clone)]
 pub struct Store {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 /// 用户视图。
@@ -35,6 +43,32 @@ pub enum StoreError {
     /// 建用户时用户名撞车。
     #[error("用户名已存在")]
     UsernameTaken,
+    /// 文件系统读写失败 (blob 落盘/删除、临时文件)。
+    #[error("文件系统错误: {0}")]
+    Io(#[from] std::io::Error),
+    /// 上传内容算出的 SHA-256 与客户端声明不符。
+    #[error("内容哈希与声明不符")]
+    HashMismatch,
+    /// 指向引用了不存在的 blob (或读取时库里没有该 hash)。
+    #[error("blob 不存在")]
+    BlobNotFound,
+    /// 引用配额超限 (文档第 6 章第一道闸)。
+    #[error("空间配额不足")]
+    QuotaExceeded,
+    /// 减账会减成负数, 账本拒绝。
+    #[error("用量账本不能减成负数")]
+    UsageUnderflow,
+    /// 盘上可用空间低于余量红线 (文档第 6 章第二道闸)。
+    #[error("磁盘可用空间不足 (可用 {free} 字节, 红线 {reserve} 字节)")]
+    DiskReserve {
+        /// 当前可用字节数。
+        free: u64,
+        /// 配置的余量红线。
+        reserve: u64,
+    },
+    /// 文件大小超出数据库 BIGINT 可表达范围 (实际不可能达到, 兜底)。
+    #[error("文件大小超出可存储范围")]
+    TooLarge,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
