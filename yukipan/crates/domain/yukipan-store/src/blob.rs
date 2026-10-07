@@ -326,14 +326,13 @@ impl BlobStore {
         Ok(row.map(|(sha,)| sha))
     }
 
-    /// 引用计数: 还指着这个 hash 的指向行数 = private_refs + image_refs 之和
-    /// (文档第 6 章: 三个空间都不要了, 磁盘才真正丢掉)。
-    ///
-    /// 扩展点 (切片 4): 访客 (guest_refs) 指向表落地后并入求和, 删除判据同步生效。
+    /// 引用计数: 还指着这个 hash 的指向行数 = private_refs + image_refs + guest_refs
+    /// 之和 (文档第 6 章: 三个空间都不要了, 磁盘才真正丢掉)。三表已齐。
     pub async fn blob_ref_count(&self, sha256: &str) -> Result<u64> {
         let (n,): (i64,) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM private_refs WHERE sha256 = $1)
-                  + (SELECT COUNT(*) FROM image_refs WHERE sha256 = $1)",
+                  + (SELECT COUNT(*) FROM image_refs WHERE sha256 = $1)
+                  + (SELECT COUNT(*) FROM guest_refs WHERE sha256 = $1)",
         )
         .bind(sha256)
         .fetch_one(&self.pool)
@@ -357,7 +356,8 @@ impl BlobStore {
             "DELETE FROM blobs b
              WHERE b.sha256 = $1
                AND NOT EXISTS (SELECT 1 FROM private_refs r WHERE r.sha256 = b.sha256)
-               AND NOT EXISTS (SELECT 1 FROM image_refs i WHERE i.sha256 = b.sha256)",
+               AND NOT EXISTS (SELECT 1 FROM image_refs i WHERE i.sha256 = b.sha256)
+               AND NOT EXISTS (SELECT 1 FROM guest_refs g WHERE g.sha256 = b.sha256)",
         )
         .bind(sha256)
         .execute(&self.pool)

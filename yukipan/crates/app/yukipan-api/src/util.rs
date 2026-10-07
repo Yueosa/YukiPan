@@ -1,12 +1,54 @@
 //! 上传共用小件: multipart 流式落 tmp、Content-Length、错误映射 (私有区与图床共用)。
 
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use axum::extract::Multipart;
+use axum::extract::{ConnectInfo, FromRequestParts, Multipart};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
 use tokio::io::AsyncWriteExt;
 
+use crate::AppState;
 use crate::error::ApiError;
+
+/// ConnectInfo 的可选版: axum 0.8 的 ConnectInfo 没有 OptionalFromRequestParts,
+/// 直接写 Option<ConnectInfo> 不让过 Handler; 包一层, oneshot 测试 (无连接信息)
+/// 或非常规部署下取 None 而不是 500。
+pub struct MaybeConnectInfo(pub Option<SocketAddr>);
+
+impl FromRequestParts<AppState> for MaybeConnectInfo {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0),
+        ))
+    }
+}
+
+/// 客户端 IP: X-Real-IP 优先, 其次 ConnectInfo, 都没有退回 0.0.0.0
+/// (直连无头场景共享一个限流桶)。
+///
+/// 信任边界: X-Real-IP 只在 nginx 反代之后可信 (nginx 会重写它, 文档第 8 章的
+/// 部署形态); 若绕过 nginx 直连后端, 客户端可伪造该头绕过按 IP 限流 — 这是
+/// 部署约定兜底的问题, 不在这里防。
+pub fn client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> IpAddr {
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+    if let Some(addr) = connect_info {
+        return addr.ip();
+    }
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
 
 /// 收 multipart 的 `file` 字段流式写进 tmp, 返回声明的文件名。
 /// `max_bytes` 给上限 (图床单文件 20MB 这档): 写超就中止报 413,

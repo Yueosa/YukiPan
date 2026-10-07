@@ -542,6 +542,7 @@ mod db_tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
     use yukipan_config::Config;
+    use yukipan_limit::Limiter;
     use yukipan_store::{BlobStore, Space, Store};
 
     use super::*;
@@ -568,6 +569,7 @@ mod db_tests {
         let state = AppState {
             store: Store::new(pool.clone()),
             blobs: BlobStore::new(pool, &data_root),
+            limiter: Limiter::degraded(),
             config,
         };
         let app = crate::router(state.clone());

@@ -3,6 +3,7 @@
 mod auth;
 mod error;
 pub mod fs;
+pub mod guest;
 pub mod images;
 mod util;
 mod wire;
@@ -11,6 +12,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use yukipan_config::Config;
+use yukipan_limit::Limiter;
 use yukipan_store::{BlobStore, Store};
 
 pub use auth::AuthUser;
@@ -22,6 +24,7 @@ pub use wire::Envelope;
 pub struct AppState {
     pub store: Store,
     pub blobs: BlobStore,
+    pub limiter: Limiter,
     pub config: Config,
 }
 
@@ -60,6 +63,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/images/delete", post(images::delete_image))
         .route("/api/images/tags", post(images::set_tags))
         .route("/api/images/share", post(images::share))
+        // 访客: 匿名上传 (限流走 Limiter, 摘默认 body 限制, 50MB 档在 handler 里卡)
+        .route(
+            "/api/guest/upload",
+            post(guest::upload).layer(DefaultBodyLimit::disable()),
+        )
+        // 访客: 登录管理
+        .route("/api/guest/list", get(guest::list))
+        .route("/api/guest/delete", post(guest::delete))
+        .route("/api/guest/clear", post(guest::clear))
+        .route("/api/guest/share", post(guest::share))
         .with_state(state)
 }
 
@@ -84,6 +97,7 @@ mod tests {
         AppState {
             store: Store::new(pool.clone()),
             blobs: BlobStore::new(pool, "/nonexistent-test-root"),
+            limiter: Limiter::degraded(),
             config: Config::parse(r#"database_url = "postgres://x""#).unwrap(),
         }
     }
@@ -137,6 +151,35 @@ mod tests {
     }
 
     /// 私有区 8 端点无 cookie 一律 401 (鉴权提取器最先跑, 不碰库不碰盘)。
+    /// 访客管理端点无 cookie 一律 401 (upload 是匿名口, 不在此列)。
+    #[tokio::test]
+    async fn guest_admin_routes_require_login() {
+        let cases: Vec<(&str, &str, Body)> = vec![
+            ("GET", "/api/guest/list", Body::empty()),
+            (
+                "POST",
+                "/api/guest/delete",
+                Body::from(r#"{"id":"00000000-0000-0000-0000-000000000000"}"#),
+            ),
+            ("POST", "/api/guest/clear", Body::empty()),
+            ("POST", "/api/guest/share", Body::from(r#"{"path":"a.txt"}"#)),
+        ];
+        for (method, uri, body) in cases {
+            let resp = router(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
     /// 图床管理端点无 cookie 一律 401; 公开端点 (albums/images/tags) 不在此列。
     #[tokio::test]
     async fn image_admin_routes_require_login() {

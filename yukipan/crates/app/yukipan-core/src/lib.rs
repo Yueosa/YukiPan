@@ -1,11 +1,13 @@
 //! YukiPan 装配层: 配置、库连接、域名服务、HTTP 监听、管理子命令。
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use yukipan_api::AppState;
 use yukipan_config::{Config, ConfigError};
 use yukipan_db::DbError;
+use yukipan_limit::Limiter;
 use yukipan_store::{BlobStore, Store, StoreError};
 
 /// 装配/运行期错误。
@@ -37,16 +39,40 @@ pub async fn run() -> Result<(), CoreError> {
     ensure_data_root_layout(&config.data_root)?;
     let pool = yukipan_db::connect(&config.database_url).await?;
     yukipan_db::migrate(&pool).await?;
-    let app = yukipan_api::router(AppState {
+    let state = AppState {
         store: Store::new(pool.clone()),
         blobs: BlobStore::new(pool, &config.data_root),
+        // Redis 连不上时 Limiter 内部降级为放行 (防风暴不做单点故障), 详见 yukipan-limit。
+        limiter: Limiter::connect(&config.redis_url).await,
         config: config.clone(),
-    });
+    };
+    spawn_guest_sweeper(state.clone());
+    let app = yukipan_api::router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
+}
+
+/// TTL 清扫 (文档第 4、6 章): 启动先立即跑一遍 (停机期间过期的也能清掉),
+/// 之后每小时一次。单轮失败只记日志, 不中断后续轮次。
+fn spawn_guest_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        // interval 第一次 tick 立即触发, 正好当启动即扫用。
+        loop {
+            interval.tick().await;
+            match yukipan_store::sweep_expired_guests(&state.blobs, &state.store).await {
+                Ok(n) if n > 0 => eprintln!("TTL 清扫: 清掉 {n} 条过期访客指向"),
+                Ok(_) => {}
+                Err(e) => eprintln!("TTL 清扫失败 (下轮重试): {e}"),
+            }
+        }
+    });
 }
 
 /// 数据根子目录布局兜底 (文档第 6 章)。生产由 ops/bootstrap-host.sh 建,

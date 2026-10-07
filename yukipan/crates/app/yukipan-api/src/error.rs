@@ -23,8 +23,7 @@ pub enum ApiError {
     Conflict(String),
     /// 配额/大小超限。
     PayloadTooLarge(String),
-    /// 限流 (切片 4 接入, 先占位)。
-    #[allow(dead_code)]
+    /// 限流 (短时计数超阈值, 文档第 5 章)。
     TooManyRequests(String),
     /// 内部错误, 细节只进服务端日志, 不回给前端。
     Internal(String),
@@ -49,6 +48,10 @@ impl ApiError {
 
     pub fn too_large(message: impl Into<String>) -> Self {
         Self::PayloadTooLarge(message.into())
+    }
+
+    pub fn too_many(message: impl Into<String>) -> Self {
+        Self::TooManyRequests(message.into())
     }
 }
 

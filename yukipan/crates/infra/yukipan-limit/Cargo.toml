@@ -9,3 +9,7 @@ description = "YukiPan Redis 短时计数：公开页风暴与登录爆破"
 [dependencies]
 redis = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }

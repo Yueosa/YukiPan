@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{Result, Store, StoreError};
+use crate::{Result, Store, StoreError, sql_safe};
 
 /// 默认相册名 (上传/秒传/分享不指定相册时落入, 懒建)。
 pub const DEFAULT_ALBUM_NAME: &str = "默认相册";
@@ -83,12 +83,6 @@ fn row_to_image(r: ImageRow) -> ImageRef {
         tags: r.7,
         created_at: r.8,
     }
-}
-
-/// IMAGE_SELECT/FILTER 只拼编译期常量, 用户输入全部走绑定参数 (文档第 5 章),
-/// 人工审查无注入面, 用 AssertSqlSafe 向 sqlx 0.9 声明。
-fn sql_safe(sql: String) -> sqlx::AssertSqlSafe<String> {
-    sqlx::AssertSqlSafe(sql)
 }
 
 impl Store {
