@@ -1,10 +1,15 @@
 // XHR 上传: fetch 没有上传进度, 用 XMLHttpRequest; 返回 { promise, abort } 支持取消。
 import { ApiError } from './api'
 
-export function xhrUpload(url, file, { onProgress, fields } = {}) {
+export function xhrUpload(url, file, { onProgress, fields, headers } = {}) {
   const xhr = new XMLHttpRequest()
   const promise = new Promise((resolve, reject) => {
     xhr.open('POST', url)
+    if (headers) {
+      for (const [k, v] of Object.entries(headers)) {
+        if (v !== undefined && v !== null && v !== '') xhr.setRequestHeader(k, v)
+      }
+    }
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total)
     }

@@ -2,12 +2,12 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { auth, initAuth } from './store'
 
 const routes = [
-  { path: '/', redirect: '/files' },
+  { path: '/', redirect: '/photos' },
   { path: '/login', component: () => import('./views/LoginView.vue'), meta: { public: true } },
   { path: '/files', component: () => import('./views/FilesView.vue') },
   { path: '/photos', component: () => import('./views/PhotosView.vue'), meta: { public: true } },
   { path: '/guest', component: () => import('./views/GuestView.vue'), meta: { public: true } },
-  { path: '/:pathMatch(.*)*', redirect: '/files' },
+  { path: '/:pathMatch(.*)*', redirect: '/photos' },
 ]
 
 export const router = createRouter({

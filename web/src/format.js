@@ -54,6 +54,16 @@ export function joinPath(dir, name) {
   return dir ? `${dir}/${name}` : name
 }
 
+// 访客密钥: 8 位短码。输入归一 (自动大写, 容忍粘贴时带 `-`/空格), 展示按 XXXX-XXXX 分组
+export function normalizeGuestCode(v) {
+  return (v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8)
+}
+
+export function groupGuestCode(code) {
+  const c = normalizeGuestCode(code)
+  return c.length > 4 ? `${c.slice(0, 4)}-${c.slice(4)}` : c
+}
+
 export function parentPath(path) {
   const i = path.lastIndexOf('/')
   return i < 0 ? '' : path.slice(0, i)
