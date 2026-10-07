@@ -116,7 +116,7 @@ impl BlobStore {
     /// 第二道闸: 数据根所在文件系统的可用空间 (对运行用户) 必须 > reserve
     /// (文档第 6 章; tmp/库/日志不进账本, 靠这道兜底)。返回可用字节数。
     pub fn check_disk_reserve(&self, reserve: u64) -> Result<u64> {
-        let free = disk_available_bytes(self.data_root())?;
+        let free = disk_free(self.data_root())?;
         if free > reserve {
             Ok(free)
         } else {
@@ -126,7 +126,8 @@ impl BlobStore {
 }
 
 /// statvfs 可用字节 (f_bavail × f_frsize, 即非 root 用户视角)。
-fn disk_available_bytes(path: &Path) -> std::io::Result<u64> {
+/// 配额端点与磁盘余量闸共用。
+pub fn disk_free(path: &Path) -> std::io::Result<u64> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含 NUL"))?;
     // statvfs 无失败内存语义, zeroed 是合法初值。
@@ -145,10 +146,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn disk_available_bytes_reports_tmpdir() {
+    fn disk_free_reports_tmpdir() {
         let tmp = TempDir::new().unwrap();
-        assert!(disk_available_bytes(tmp.path()).unwrap() > 0);
-        assert!(disk_available_bytes(&tmp.path().join("missing")).is_err());
+        assert!(disk_free(tmp.path()).unwrap() > 0);
+        assert!(disk_free(&tmp.path().join("missing")).is_err());
     }
 
     #[tokio::test]

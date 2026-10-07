@@ -40,3 +40,10 @@ upload_per_hour = 10
 upload_bytes_per_hour = 209715200   # 200 MiB
 # 每 IP 每天上传字节上限
 upload_bytes_per_day = 524288000    # 500 MiB
+
+# 登录爆破计数: 按 IP 固定窗口记失败, 达到上限后该 IP 一律 429 直到窗口过期 (文档第 5 章)
+[auth]
+# 窗口内允许的最大失败次数
+login_fail_max = 10
+# 失败计数窗口 (秒), 从第一次失败算起
+login_fail_window_secs = 600

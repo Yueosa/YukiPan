@@ -20,6 +20,7 @@ use yukipan_store::Space;
 
 use crate::auth::AuthUser;
 use crate::util::{content_length, internal_io, stream_to_tmp};
+use tracing::{error, warn};
 use crate::error::ApiError;
 use crate::wire::Envelope;
 use crate::AppState;
@@ -159,14 +160,14 @@ pub async fn delete(
     if total > 0
         && let Err(e) = state.store.usage_sub(uid, Space::Private, total).await
     {
-        eprintln!("删除后减账失败 (账本可能漂移): {e}");
+        warn!("删除后减账失败 (账本可能漂移): {e}");
     }
     let mut hashes: Vec<&str> = refs.iter().map(|r| r.sha256.as_str()).collect();
     hashes.sort_unstable();
     hashes.dedup();
     for sha in hashes {
         if let Err(e) = state.blobs.delete_blob_if_unreferenced(sha).await {
-            eprintln!("删除后清理 blob 失败 ({sha}): {e}");
+            warn!("删除后清理 blob 失败 ({sha}): {e}");
         }
     }
     Ok(Json(Envelope::ok(())))
@@ -311,7 +312,7 @@ fn serve_file(
     let root = user_root(state, uid)?;
     let abs = root.resolve_existing(&path)?;
     let meta = std::fs::metadata(&abs).map_err(|e| {
-        eprintln!("读文件元数据失败: {e}");
+        error!("读文件元数据失败: {e}");
         ApiError::Internal("内部错误".into())
     })?;
     if meta.is_dir() {
@@ -469,7 +470,7 @@ fn pct_encode(s: &str) -> String {
 /// 减账回滚: 失败只记日志 (账本漂移由对账兜底, 不遮主错误)。
 async fn rollback_usage(state: &AppState, uid: Uuid, size: u64) {
     if let Err(e) = state.store.usage_sub(uid, Space::Private, size).await {
-        eprintln!("回滚减账失败: {e}");
+        warn!("回滚减账失败: {e}");
     }
 }
 
@@ -477,7 +478,7 @@ async fn rollback_usage(state: &AppState, uid: Uuid, size: u64) {
 /// deduped 场景下还有别人的指向, delete_blob_if_unreferenced 自己会判断)。
 async fn rollback_blob(state: &AppState, sha256: &str) {
     if let Err(e) = state.blobs.delete_blob_if_unreferenced(sha256).await {
-        eprintln!("回滚清 blob 失败: {e}");
+        warn!("回滚清 blob 失败: {e}");
     }
 }
 

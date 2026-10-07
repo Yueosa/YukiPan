@@ -21,6 +21,7 @@ use crate::error::ApiError;
 use crate::images::Page;
 use crate::util::{MaybeConnectInfo, client_ip, content_length, internal_io, stream_to_tmp};
 use crate::wire::Envelope;
+use tracing::{error, warn};
 
 /// 公开 url 前缀 (nginx 直出, 限速档见文档第 5 章)。
 const PUBLIC_URL_PREFIX: &str = "/public/guest/";
@@ -266,7 +267,7 @@ async fn finish_guest_upload(
         // 库里还没有任何用户: 指向必须挂账 (charged_to 外键), 无处可记只能拒。
         // 正常部署 bootstrap 已建好管理员, 不会走到这里。
         let _ = std::fs::remove_file(tmp);
-        eprintln!("访客上传被拒: 库里没有任何用户, 无法挂配额账");
+        error!("访客上传被拒: 库里没有任何用户, 无法挂配额账");
         return Err(ApiError::Internal("服务未初始化".into()));
     };
     state.store.check_quota(uid, Space::Guest, size, limit).await?;
@@ -365,13 +366,13 @@ fn guest_ext(name: &str) -> Option<String> {
 
 async fn rollback_usage(state: &AppState, uid: Uuid, size: u64) {
     if let Err(e) = state.store.usage_sub(uid, Space::Guest, size).await {
-        eprintln!("回滚减账失败: {e}");
+        warn!("回滚减账失败: {e}");
     }
 }
 
 async fn rollback_blob(state: &AppState, sha256: &str) {
     if let Err(e) = state.blobs.delete_blob_if_unreferenced(sha256).await {
-        eprintln!("回滚清 blob 失败: {e}");
+        warn!("回滚清 blob 失败: {e}");
     }
 }
 

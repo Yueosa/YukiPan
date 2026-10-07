@@ -36,6 +36,28 @@ pub struct Config {
     /// 访客空间的 TTL 与按 IP 限流。
     #[serde(default)]
     pub guest: Guest,
+    /// 登录爆破计数 (文档第 5 章)。
+    #[serde(default)]
+    pub auth: Auth,
+}
+
+/// 登录爆破计数: 按 IP 固定窗口记失败, 超阈值 429 (文档第 5 章)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Auth {
+    /// 窗口内允许的最大失败次数, 达到后该 IP 一律 429 直到窗口过期。
+    pub login_fail_max: u64,
+    /// 失败计数窗口 (秒), 从第一次失败算起。
+    pub login_fail_window_secs: u64,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Self {
+            login_fail_max: 10,
+            login_fail_window_secs: 600,
+        }
+    }
 }
 
 /// 访客空间防滥用: TTL 自动过期 + 按 IP 限流 (文档第 4、5 章)。
@@ -200,6 +222,18 @@ mod tests {
         assert_eq!(q.reserve, 2 * GIB);
         assert_eq!(q.guest_max_file, 50 * MIB);
         assert_eq!(q.images_max_file, 20 * MIB);
+    }
+
+    #[test]
+    fn auth_defaults_match_doc() {
+        let a = Auth::default();
+        assert_eq!(a.login_fail_max, 10);
+        assert_eq!(a.login_fail_window_secs, 600);
+        let c = Config::parse(r#"database_url = "x""#).unwrap();
+        assert_eq!(c.auth, a);
+        let c = Config::parse("database_url = \"x\"\n[auth]\nlogin_fail_max = 3").unwrap();
+        assert_eq!(c.auth.login_fail_max, 3);
+        assert_eq!(c.auth.login_fail_window_secs, 600);
     }
 
     #[test]

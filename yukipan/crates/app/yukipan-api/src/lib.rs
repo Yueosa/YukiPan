@@ -5,6 +5,7 @@ mod error;
 pub mod fs;
 pub mod guest;
 pub mod images;
+mod quota;
 mod util;
 mod wire;
 
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        .route("/api/quota", get(quota::quota))
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/fs/move", post(fs::move_entry))
@@ -151,6 +153,15 @@ mod tests {
     }
 
     /// 私有区 8 端点无 cookie 一律 401 (鉴权提取器最先跑, 不碰库不碰盘)。
+    #[tokio::test]
+    async fn quota_requires_login() {
+        let resp = router(test_state())
+            .oneshot(Request::get("/api/quota").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// 访客管理端点无 cookie 一律 401 (upload 是匿名口, 不在此列)。
     #[tokio::test]
     async fn guest_admin_routes_require_login() {

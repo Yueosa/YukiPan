@@ -18,6 +18,7 @@ use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::util::{content_length, internal_io, multipart_err, stream_to_tmp};
 use crate::wire::Envelope;
+use tracing::warn;
 
 /// 公开 url 前缀 (nginx 直出, 文档第 8 章)。
 const PUBLIC_URL_PREFIX: &str = "/public/images/";
@@ -328,17 +329,17 @@ pub async fn delete_image(
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("删除公开图文件失败 ({}): {e}", image.public_name);
+        warn!("删除公开图文件失败 ({}): {e}", image.public_name);
     }
     if let Err(e) = state
         .store
         .usage_sub(uid, Space::Images, image.size)
         .await
     {
-        eprintln!("删图后减账失败 (账本可能漂移): {e}");
+        warn!("删图后减账失败 (账本可能漂移): {e}");
     }
     if let Err(e) = state.blobs.delete_blob_if_unreferenced(&image.sha256).await {
-        eprintln!("删图后清理 blob 失败 ({}): {e}", image.sha256);
+        warn!("删图后清理 blob 失败 ({}): {e}", image.sha256);
     }
     Ok(Json(Envelope::ok(())))
 }
@@ -550,13 +551,13 @@ fn is_sha256_hex(s: &str) -> bool {
 
 async fn rollback_usage(state: &AppState, uid: Uuid, size: u64) {
     if let Err(e) = state.store.usage_sub(uid, Space::Images, size).await {
-        eprintln!("回滚减账失败: {e}");
+        warn!("回滚减账失败: {e}");
     }
 }
 
 async fn rollback_blob(state: &AppState, sha256: &str) {
     if let Err(e) = state.blobs.delete_blob_if_unreferenced(sha256).await {
-        eprintln!("回滚清 blob 失败: {e}");
+        warn!("回滚清 blob 失败: {e}");
     }
 }
 

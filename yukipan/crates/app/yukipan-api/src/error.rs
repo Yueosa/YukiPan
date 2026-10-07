@@ -7,6 +7,7 @@ use yukipan_fs::{PathError, ResolveError};
 use yukipan_store::StoreError;
 
 use crate::wire::Envelope;
+use tracing::error;
 
 /// handler 返回的错误, 统一渲成 `{ success: false, data: null, message }`。
 #[derive(Debug)]
@@ -69,7 +70,7 @@ impl From<StoreError> for ApiError {
             StoreError::DefaultAlbumForbidden => Self::bad_request("默认相册不能删除"),
             StoreError::ImageNotFound => Self::not_found("图片不存在"),
             other => {
-                eprintln!("store error: {other}");
+                error!("store error: {other}");
                 Self::Internal("内部错误".into())
             }
         }
@@ -94,7 +95,7 @@ impl From<ResolveError> for ApiError {
             ResolveError::RootForbidden => Self::bad_request("根目录不允许该操作"),
             ResolveError::AlreadyExists => Self::conflict("目标已存在"),
             ResolveError::Io(e) => {
-                eprintln!("fs io error: {e}");
+                error!("fs io error: {e}");
                 Self::Internal("内部错误".into())
             }
         }

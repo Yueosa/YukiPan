@@ -9,6 +9,7 @@ use yukipan_config::{Config, ConfigError};
 use yukipan_db::DbError;
 use yukipan_limit::Limiter;
 use yukipan_store::{BlobStore, Store, StoreError};
+use tracing::{error, info};
 
 /// 装配/运行期错误。
 #[derive(Debug, Error)]
@@ -35,10 +36,13 @@ pub enum CoreError {
 
 /// 装配并运行, 直到收到 SIGINT/SIGTERM 后优雅退出。
 pub async fn run() -> Result<(), CoreError> {
+    init_tracing();
     let config = Config::load(config_path())?;
+    info!(data_root = %config.data_root.display(), "配置已加载");
     ensure_data_root_layout(&config.data_root)?;
     let pool = yukipan_db::connect(&config.database_url).await?;
     yukipan_db::migrate(&pool).await?;
+    info!("数据库迁移完成");
     let state = AppState {
         store: Store::new(pool.clone()),
         blobs: BlobStore::new(pool, &config.data_root),
@@ -49,6 +53,7 @@ pub async fn run() -> Result<(), CoreError> {
     spawn_guest_sweeper(state.clone());
     let app = yukipan_api::router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    info!(listen = %config.listen, "HTTP 服务启动");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -61,15 +66,16 @@ pub async fn run() -> Result<(), CoreError> {
 /// TTL 清扫 (文档第 4、6 章): 启动先立即跑一遍 (停机期间过期的也能清掉),
 /// 之后每小时一次。单轮失败只记日志, 不中断后续轮次。
 fn spawn_guest_sweeper(state: AppState) {
+    info!("访客 TTL 清扫任务已启动 (每小时, 启动即扫一轮)");
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         // interval 第一次 tick 立即触发, 正好当启动即扫用。
         loop {
             interval.tick().await;
             match yukipan_store::sweep_expired_guests(&state.blobs, &state.store).await {
-                Ok(n) if n > 0 => eprintln!("TTL 清扫: 清掉 {n} 条过期访客指向"),
+                Ok(n) if n > 0 => info!("TTL 清扫: 清掉 {n} 条过期访客指向"),
                 Ok(_) => {}
-                Err(e) => eprintln!("TTL 清扫失败 (下轮重试): {e}"),
+                Err(e) => error!("TTL 清扫失败 (下轮重试): {e}"),
             }
         }
     });
@@ -100,6 +106,18 @@ pub async fn user_add(username: &str) -> Result<(), CoreError> {
     store.create_user(username, &password).await?;
     println!("用户 {username} 已创建");
     Ok(())
+}
+
+/// tracing 初始化: RUST_LOG 环境变量控制级别 (缺省 info), 紧凑单行无颜色
+/// (生产走 journal, 颜色与控制字符都是噪音)。
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .compact()
+        .init();
 }
 
 /// 配置文件位置: `YUKIPAN_CONFIG` 优先, 否则 `/etc/yukipan/config.toml`。

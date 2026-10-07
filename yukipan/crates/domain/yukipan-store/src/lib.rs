@@ -12,7 +12,7 @@ mod quota;
 pub use blob::{BlobStore, IngestOutcome, PrivateRef};
 pub use guest::{GuestRef, finish_guest_ref_delete, sweep_expired_guests};
 pub use image::{Album, AlbumSummary, ImageRef, TagSummary, normalize_tag_name};
-pub use quota::Space;
+pub use quota::{Space, disk_free};
 
 /// 共享 SELECT 常量与过滤条件只拼编译期常量, 用户输入全部走绑定参数 (文档第 5 章),
 /// 人工审查无注入面, 用 AssertSqlSafe 向 sqlx 0.9 声明。

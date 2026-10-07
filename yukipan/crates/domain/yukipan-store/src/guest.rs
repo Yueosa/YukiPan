@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{BlobStore, Result, Space, Store, StoreError, sql_safe};
+use tracing::warn;
 
 /// 访客指向记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,13 +189,13 @@ pub async fn finish_guest_ref_delete(blobs: &BlobStore, store: &Store, r: &Guest
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("删访客公开文件失败 ({}): {e}", r.public_name);
+        warn!("删访客公开文件失败 ({}): {e}", r.public_name);
     }
     if let Err(e) = store.usage_sub(r.charged_to, Space::Guest, r.size).await {
-        eprintln!("删访客指向后减账失败 (账本可能漂移): {e}");
+        warn!("删访客指向后减账失败 (账本可能漂移): {e}");
     }
     if let Err(e) = blobs.delete_blob_if_unreferenced(&r.sha256).await {
-        eprintln!("删访客指向后清理 blob 失败 ({}): {e}", r.sha256);
+        warn!("删访客指向后清理 blob 失败 ({}): {e}", r.sha256);
     }
 }
 

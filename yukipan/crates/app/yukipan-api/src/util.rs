@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 use crate::error::ApiError;
+use tracing::error;
 
 /// ConnectInfo 的可选版: axum 0.8 的 ConnectInfo 没有 OptionalFromRequestParts,
 /// 直接写 Option<ConnectInfo> 不让过 Handler; 包一层, oneshot 测试 (无连接信息)
@@ -100,6 +101,6 @@ pub fn multipart_err(e: axum::extract::multipart::MultipartError) -> ApiError {
 }
 
 pub fn internal_io(e: std::io::Error) -> ApiError {
-    eprintln!("io error: {e}");
+    error!("io error: {e}");
     ApiError::Internal("内部错误".into())
 }

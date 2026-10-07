@@ -2,7 +2,7 @@
 //!
 //! 固定窗口计数: key 首次 INCR 时上 TTL, 窗口从第一次命中算起。
 //!
-//! 降级策略: Redis 连不上/操作失败时一律放行 (返回 0 / Ok), 只 eprintln。
+//! 降级策略: Redis 连不上/操作失败时一律放行 (返回 0 / Ok), 只记日志。
 //! 防风暴是保护层, 不该成为单点故障 — 网盘核心功能 (含登录) 不依赖 Redis;
 //! 代价是 Redis 挂的时候限流与爆破计数同时失效, 这是有意的权衡。
 
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use thiserror::Error;
+use tracing::{info, warn};
 
 /// 限流层错误。仅在显式需要时透出; 正常流程走降级放行, 不抛给调用方。
 #[derive(Debug, Error)]
@@ -36,18 +37,29 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// 连 Redis; 连不上进入降级模式 (eprintln 告警), 不返回错误 — 见模块文档。
+    /// 连 Redis; 连不上进入降级模式 (warn 告警), 不返回错误 — 见模块文档。
+    ///
+    /// 首次连接带超时: ConnectionManager 内部是无限退避重连, 不兜底的话
+    /// Redis 挂了会卡住整个服务启动。
     pub async fn connect(redis_url: &str) -> Self {
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
         match redis::Client::open(redis_url) {
-            Ok(client) => match client.get_connection_manager().await {
-                Ok(conn) => Self { conn: Some(conn) },
-                Err(e) => {
-                    eprintln!("警告: Redis 连接失败 ({e}), 限流降级为放行");
+            Ok(client) => match tokio::time::timeout(CONNECT_TIMEOUT, client.get_connection_manager()).await {
+                Err(_) => {
+                    warn!("Redis 连接超时 ({CONNECT_TIMEOUT:?}), 限流降级为放行");
                     Self { conn: None }
+                }
+                Ok(Err(e)) => {
+                    warn!("Redis 连接失败 ({e}), 限流降级为放行");
+                    Self { conn: None }
+                }
+                Ok(Ok(conn)) => {
+                    info!("Redis 已连接, 限流计数生效");
+                    Self { conn: Some(conn) }
                 }
             },
             Err(e) => {
-                eprintln!("警告: Redis URL 不合法 ({e}), 限流降级为放行");
+                warn!("Redis URL 不合法 ({e}), 限流降级为放行");
                 Self { conn: None }
             }
         }
@@ -77,7 +89,7 @@ impl Limiter {
         match result {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("警告: Redis 计数失败 ({e}), 本次放行");
+                warn!("Redis 计数失败 ({e}), 本次放行");
                 0
             }
         }
@@ -95,7 +107,7 @@ impl Limiter {
             Ok(Some(s)) => s.parse().unwrap_or(0),
             Ok(None) => 0,
             Err(e) => {
-                eprintln!("警告: Redis 读计数失败 ({e}), 本次放行");
+                warn!("Redis 读计数失败 ({e}), 本次放行");
                 0
             }
         }
@@ -110,7 +122,7 @@ impl Limiter {
             .query_async::<()>(&mut conn)
             .await
         {
-            eprintln!("警告: Redis 清计数失败 ({e})");
+            warn!("Redis 清计数失败 ({e})");
         }
     }
 }

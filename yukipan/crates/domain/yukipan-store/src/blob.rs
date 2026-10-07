@@ -13,6 +13,7 @@ use uuid::Uuid;
 use yukipan_fs::LogicalPath;
 
 use crate::{Result, StoreError};
+use tracing::warn;
 
 /// 收编 (ingest) 一个 blob 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,7 +374,7 @@ impl BlobStore {
             .expect("删文件线程 panic")
             && e.kind() != ErrorKind::NotFound
         {
-            eprintln!("警告: 删除 blob 文件失败 ({sha256}): {e} (留孤儿文件, 不影响一致性)");
+            warn!("删除 blob 文件失败 ({sha256}): {e} (留孤儿文件, 不影响一致性)");
         }
         Ok(true)
     }

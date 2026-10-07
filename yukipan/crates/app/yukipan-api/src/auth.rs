@@ -20,10 +20,6 @@ use crate::wire::Envelope;
 /// 会话 cookie 名。
 pub const SESSION_COOKIE: &str = "yukipan_session";
 
-/// 登录爆破计数 (文档第 5 章): 按 IP 固定窗口记失败, 超阈值 429。
-/// 写死常量 — config 没有这一项; 若以后要可调, 加进 config.toml 的 [guest] 式小节。
-const LOGIN_FAIL_WINDOW: Duration = Duration::from_secs(600);
-const LOGIN_FAIL_MAX: u64 = 10;
 
 /// 登录/会话返回的用户视图。
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -62,8 +58,8 @@ pub async fn login(
     }
     let ip = client_ip(&headers, connect_info.0);
     let fail_key = format!("login:fail:{ip}");
-    // 「动作后记录, 超阈值拒绝下次尝试」: 先查后验。
-    if state.limiter.get(&fail_key).await >= LOGIN_FAIL_MAX {
+    // 「动作后记录, 超阈值拒绝下次尝试」: 先查后验。阈值/窗口走 config [auth]。
+    if state.limiter.get(&fail_key).await >= state.config.auth.login_fail_max {
         return Err(ApiError::too_many("失败次数过多, 请稍后再试"));
     }
     let user = state
@@ -71,7 +67,10 @@ pub async fn login(
         .verify_login(&req.username, &req.password)
         .await?;
     let Some(user) = user else {
-        state.limiter.incr(&fail_key, LOGIN_FAIL_WINDOW).await;
+        state
+            .limiter
+            .incr(&fail_key, Duration::from_secs(state.config.auth.login_fail_window_secs))
+            .await;
         return Err(ApiError::unauthorized("用户名或密码错误"));
     };
     state.limiter.clear(&fail_key).await;
